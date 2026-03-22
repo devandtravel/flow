@@ -6,6 +6,7 @@ export default defineConfig({
     'apps/daemon/index': 'apps/daemon/index.ts',
     'apps/worker/index': 'apps/worker/index.ts',
   },
+  external: ['node:sqlite'],
   format: ['cjs'],
   target: 'node20',
   platform: 'node',

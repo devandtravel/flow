@@ -1,7 +1,11 @@
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
+import { createRequire } from 'node:module';
+
+const sqliteModuleName = 'node:sqlite';
+const runtimeRequire = createRequire(__filename);
+const { DatabaseSync } = runtimeRequire(sqliteModuleName) as typeof import('node:sqlite');
 
 export type JsonValue = Record<string, unknown> | unknown[] | string | number | boolean | null;
 
