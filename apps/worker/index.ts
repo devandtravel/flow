@@ -4,10 +4,12 @@ import { loadConfig } from '../../packages/config';
 async function main(): Promise<void> {
   const workspaceRoot = process.cwd();
   const runtime = new AgentRuntime({ workspaceRoot, config: loadConfig(workspaceRoot) });
-  const queuedTask = runtime.listTasks().find((task) => task.state === 'queued' || task.state === 'retryable');
-  if (queuedTask) {
-    await runtime.runTask(queuedTask.id);
-  }
+  const controller = new AbortController();
+
+  process.on('SIGINT', () => controller.abort());
+  process.on('SIGTERM', () => controller.abort());
+
+  await runtime.startWorkerLoop(controller.signal);
 }
 
 void main();

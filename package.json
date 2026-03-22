@@ -19,7 +19,9 @@
     "build": "tsup",
     "lint": "eslint . --ext .ts",
     "format": "prettier --write .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "smoke": "bash scripts/smoke.sh",
+    "launch:project": "bash scripts/launch-project.sh"
   },
   "dependencies": {
     "commander": "^13.1.0",

@@ -1,26 +1,38 @@
 import { describe, expect, it } from 'vitest';
+import { buildDefaultConfig } from '../packages/config';
 import { PolicyEngine } from '../packages/policy';
 
 describe('PolicyEngine', () => {
-  it('allows allowlisted tools and blocks denied patterns', () => {
+  it('allows bounded tools, blocks denied patterns, and requests approval for sensitive capability', () => {
+    const config = buildDefaultConfig('/tmp/flow-policy', 'project');
+    config.policies.allow_tools.push('shell.exec');
+    config.capabilities.enabled.push('shell.exec');
     const policy = new PolicyEngine({
-      allow: ['fs.*'],
-      deny: [{ pattern: 'secret' }],
-      limits: { max_steps: 5, max_runtime_sec: 30, max_files_changed: 5, max_iterations: 2 },
+      ...config.policies,
+      limits: config.limits,
+      autonomy: config.autonomy,
+      workspace: config.workspace,
     });
 
     expect(
       policy.evaluateStep(
-        { tool: 'fs.read_file', input: { path: 'README.md' } },
+        { tool: 'fs.read_file', capability: 'fs.read', input: { path: 'README.md' } },
         { startedAt: Date.now(), completedSteps: 0, changedFiles: 0, iteration: 1 },
-      ).allowed,
-    ).toBe(true);
+      ).kind,
+    ).toBe('allow');
 
     expect(
       policy.evaluateStep(
-        { tool: 'fs.write_file', input: { content: 'secret' } },
+        { tool: 'fs.write_file', capability: 'fs.write', input: { content: 'rm -rf /' } },
         { startedAt: Date.now(), completedSteps: 0, changedFiles: 0, iteration: 1 },
-      ).allowed,
-    ).toBe(false);
+      ).kind,
+    ).toBe('deny');
+
+    expect(
+      policy.evaluateStep(
+        { tool: 'shell.exec', capability: 'shell.exec', input: { command: 'pwd' } },
+        { startedAt: Date.now(), completedSteps: 0, changedFiles: 0, iteration: 1 },
+      ).kind,
+    ).toBe('require_approval');
   });
 });

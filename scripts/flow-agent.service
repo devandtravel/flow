@@ -8,6 +8,7 @@ WorkingDirectory=/opt/flow-agent
 ExecStart=/usr/bin/node /opt/flow-agent/dist/apps/daemon/index.js
 Restart=always
 Environment=NODE_ENV=production
+Environment=FLOW_MODE=system
 
 [Install]
 WantedBy=multi-user.target

@@ -2,16 +2,17 @@ import { mkdtempSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { writeDefaultConfig } from '../packages/config';
+import { buildDefaultConfig } from '../packages/config';
 import { createApiServer } from '../packages/api/server';
 
-let workspaceRoot: string;
+let workspaceRoot = '';
 let api: ReturnType<typeof createApiServer>;
 
 beforeEach(async () => {
   workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-api-'));
-  writeDefaultConfig(workspaceRoot);
-  api = createApiServer(workspaceRoot);
+  const config = buildDefaultConfig(workspaceRoot, 'system');
+  config.llm.provider = 'mock';
+  api = createApiServer(workspaceRoot, config);
   await api.start();
 });
 
@@ -24,15 +25,237 @@ describe('API server', () => {
     const response = await fetch('http://127.0.0.1:4310/tasks', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ goal: 'test task', autorun: true }),
+      body: JSON.stringify({ goal: 'write api output', autorun: true }),
     });
 
     expect(response.status).toBe(201);
-    const summary = (await response.json()) as { state: string; artifacts: Array<{ id: string }> };
-    expect(summary.state).toBe('completed');
+    const summaryJson = await response.json();
+    expect(typeof summaryJson).toBe('object');
+    if (!summaryJson || typeof summaryJson !== 'object') {
+      throw new Error('Expected a summary payload.');
+    }
 
-    const tasksResponse = await fetch('http://127.0.0.1:4310/tasks');
-    const tasks = (await tasksResponse.json()) as Array<{ goal: string }>;
-    expect(tasks[0]?.goal).toBe('test task');
+    if (!('state' in summaryJson) || typeof summaryJson.state !== 'string') {
+      throw new Error('Summary payload is missing the state field.');
+    }
+
+    expect(summaryJson.state).toBe('completed');
+
+    const approvalsResponse = await fetch('http://127.0.0.1:4310/approvals');
+    const approvalsJson = await approvalsResponse.json();
+    expect(Array.isArray(approvalsJson)).toBe(true);
+
+    const targetsResponse = await fetch('http://127.0.0.1:4310/targets');
+    const targetsJson = await targetsResponse.json();
+    expect(Array.isArray(targetsJson)).toBe(true);
+
+    const targetCreateResponse = await fetch('http://127.0.0.1:4310/targets', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'service-b',
+        root: path.join(workspaceRoot, 'service-b'),
+        readPaths: ['.'],
+        writePaths: ['.'],
+        capabilities: ['fs.read', 'fs.write', 'repo.test'],
+      }),
+    });
+    expect(targetCreateResponse.status).toBe(201);
+
+    const targetShowResponse = await fetch('http://127.0.0.1:4310/targets/service-b');
+    expect(targetShowResponse.status).toBe(200);
+    const targetShowJson = await targetShowResponse.json();
+    expect(targetShowJson).toEqual(
+      expect.objectContaining({
+        id: 'service-b',
+      }),
+    );
+
+    const conflictingTargetResponse = await fetch('http://127.0.0.1:4310/targets', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'service-b-conflict',
+        root: path.join(workspaceRoot, 'service-b', 'nested'),
+        readPaths: ['.'],
+        writePaths: ['.'],
+        capabilities: ['fs.read'],
+      }),
+    });
+    expect(conflictingTargetResponse.status).toBe(409);
+
+    const invalidTargetResponse = await fetch('http://127.0.0.1:4310/targets', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'invalid-target',
+        root: path.join(workspaceRoot, 'invalid-target'),
+        readPaths: [],
+        writePaths: ['.'],
+        capabilities: ['fs.read'],
+      }),
+    });
+    expect(invalidTargetResponse.status).toBe(422);
+
+    const scheduleCreateResponse = await fetch('http://127.0.0.1:4310/schedules', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'nightly-write',
+        goal: 'write scheduled api output',
+        intervalSeconds: 3600,
+        enabled: true,
+      }),
+    });
+    expect(scheduleCreateResponse.status).toBe(201);
+
+    const schedulesResponse = await fetch('http://127.0.0.1:4310/schedules');
+    const schedulesJson = await schedulesResponse.json();
+    expect(Array.isArray(schedulesJson)).toBe(true);
+
+    const workerResponse = await fetch('http://127.0.0.1:4310/worker/run-once', {
+      method: 'POST',
+    });
+    expect(workerResponse.status).toBe(200);
+
+    if ('task' in summaryJson && summaryJson.task && typeof summaryJson.task === 'object' && 'id' in summaryJson.task && typeof summaryJson.task.id === 'string') {
+      const timelineResponse = await fetch(`http://127.0.0.1:4310/tasks/${summaryJson.task.id}/timeline?limit=1&offset=0`);
+      const timelineJson = await timelineResponse.json();
+      expect(timelineResponse.status).toBe(200);
+      expect(timelineJson).toEqual(
+        expect.objectContaining({
+          page: expect.objectContaining({
+            limit: 1,
+            offset: 0,
+          }),
+          approvals: expect.any(Array),
+          runs: expect.any(Array),
+        }),
+      );
+    } else {
+      throw new Error('Summary payload is missing task.id.');
+    }
+
+    if ('runId' in summaryJson && typeof summaryJson.runId === 'string') {
+      const runEventsResponse = await fetch(`http://127.0.0.1:4310/runs/${summaryJson.runId}/events?limit=1&offset=0`);
+      expect(runEventsResponse.status).toBe(200);
+      const runEventsJson = await runEventsResponse.json();
+      expect(runEventsJson).toEqual(
+        expect.objectContaining({
+          page: expect.objectContaining({
+            limit: 1,
+            offset: 0,
+          }),
+          events: expect.any(Array),
+        }),
+      );
+
+      const filteredRunEventsResponse = await fetch(`http://127.0.0.1:4310/runs/${summaryJson.runId}/events?limit=10&offset=0&level=info`);
+      expect(filteredRunEventsResponse.status).toBe(200);
+    }
+
+    const updatedTargetsResponse = await fetch('http://127.0.0.1:4310/targets');
+    const updatedTargetsJson = await updatedTargetsResponse.json();
+    expect(Array.isArray(updatedTargetsJson)).toBe(true);
+    expect(updatedTargetsJson).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'service-b',
+        }),
+      ]),
+    );
+
+    const deleteTargetResponse = await fetch('http://127.0.0.1:4310/targets/service-b', {
+      method: 'DELETE',
+    });
+    expect(deleteTargetResponse.status).toBe(200);
+
+    const missingTargetResponse = await fetch('http://127.0.0.1:4310/targets/missing-target');
+    expect(missingTargetResponse.status).toBe(404);
+
+    const missingTaskResponse = await fetch('http://127.0.0.1:4310/tasks/missing-task-id');
+    expect(missingTaskResponse.status).toBe(404);
+
+    const missingRunResponse = await fetch('http://127.0.0.1:4310/runs/00000000-0000-0000-0000-000000000000');
+    expect(missingRunResponse.status).toBe(404);
+
+    const cleanupResponse = await fetch('http://127.0.0.1:4310/maintenance/cleanup', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        keepLatestArtifacts: 1,
+        keepLatestRunEvents: 1,
+        keepLatestMemoryEntries: 1,
+        maxArtifactAgeDays: 0,
+        maxRunEventAgeDays: 0,
+        maxMemoryEntryAgeDays: 0,
+        dryRun: true,
+      }),
+    });
+    expect(cleanupResponse.status).toBe(200);
+    const cleanupJson = await cleanupResponse.json();
+    expect(cleanupJson).toEqual(
+      expect.objectContaining({
+        maintenanceEventId: expect.any(String),
+        dryRun: true,
+        retention: expect.objectContaining({
+          maxArtifactAgeDays: 0,
+          maxRunEventAgeDays: 0,
+          maxMemoryEntryAgeDays: 0,
+        }),
+        deletedArtifactIds: expect.any(Array),
+        deletedRunEventIds: expect.any(Array),
+        deletedMemoryEntryIds: expect.any(Array),
+      }),
+    );
+
+    const maintenanceStatusResponse = await fetch('http://127.0.0.1:4310/maintenance/status');
+    expect(maintenanceStatusResponse.status).toBe(200);
+    const maintenanceStatusJson = await maintenanceStatusResponse.json();
+    expect(maintenanceStatusJson).toEqual(
+      expect.objectContaining({
+        operation: 'cleanup',
+        intervalSeconds: null,
+        due: false,
+      }),
+    );
+
+    const maintenanceSummaryResponse = await fetch('http://127.0.0.1:4310/maintenance/summary');
+    expect(maintenanceSummaryResponse.status).toBe(200);
+    const maintenanceSummaryJson = await maintenanceSummaryResponse.json();
+    expect(maintenanceSummaryJson).toEqual(
+      expect.objectContaining({
+        operation: 'cleanup',
+        totals: expect.objectContaining({
+          all: expect.any(Number),
+          apiManual: expect.any(Number),
+        }),
+      }),
+    );
+
+    const maintenanceEventsResponse = await fetch('http://127.0.0.1:4310/maintenance/events?limit=10&offset=0&operation=cleanup&dryRun=true&trigger=api_manual');
+    expect(maintenanceEventsResponse.status).toBe(200);
+    const maintenanceEventsJson = await maintenanceEventsResponse.json();
+    expect(maintenanceEventsJson).toEqual(
+      expect.objectContaining({
+        page: expect.objectContaining({
+          total: expect.any(Number),
+          limit: 10,
+          offset: 0,
+        }),
+        events: expect.any(Array),
+      }),
+    );
+
+    const maintenanceRunDueResponse = await fetch('http://127.0.0.1:4310/maintenance/run-due', {
+      method: 'POST',
+    });
+    expect(maintenanceRunDueResponse.status).toBe(200);
+    const maintenanceRunDueJson = await maintenanceRunDueResponse.json();
+    expect(maintenanceRunDueJson).toEqual(
+      expect.objectContaining({
+        status: 'idle',
+      }),
+    );
   });
 });

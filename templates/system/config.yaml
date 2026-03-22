@@ -1,8 +1,80 @@
 mode: system
+scope:
+  root: /var/lib/flow-agent
 workspace:
   root: /var/lib/flow-agent
+  read_paths:
+    - .
+  write_paths:
+    - .
+targets:
+  - id: example-project
+    root: /var/lib/flow-agent/targets/example-project
+    read_paths:
+      - .
+    write_paths:
+      - .
+    capabilities:
+      - fs.read
+      - fs.write
+      - git.status
+      - git.branch
+      - git.commit
+      - repo.test
+      - repo.build
+      - repo.check
+      - repo.patch
+      - http.fetch
+capabilities:
+  enabled:
+    - fs.read
+    - fs.write
+    - git.status
+    - git.branch
+    - git.commit
+    - repo.test
+    - repo.build
+    - repo.check
+    - repo.patch
+    - http.fetch
+policies:
+  allow_tools:
+    - fs.*
+    - git.*
+    - repo.*
+    - http.fetch
+  deny_patterns:
+    - rm -rf
+    - sudo
+    - \.ssh
+  require_approval:
+    tools:
+      - git.commit
+      - shell.exec
+    capabilities:
+      - shell.exec
+autonomy:
+  mode: supervised
+approvals:
+  required_for:
+    tools:
+      - git.commit
+      - shell.exec
+    capabilities:
+      - shell.exec
+schedules:
+  - id: nightly-health
+    goal: run tests
+    target_id: example-project
+    interval_seconds: 86400
+    enabled: true
 llm:
   provider: codex
+  model: gpt-5-codex
+  timeout_ms: 30000
+  retry_count: 1
+  temperature: 0
+  executable: codex
 http:
   allowlist:
     - example.com
@@ -11,6 +83,17 @@ server:
   port: 4310
 worker:
   poll_interval_ms: 2000
+maintenance:
+  retention:
+    keep_latest_artifacts: 100
+    keep_latest_run_events: 200
+    keep_latest_memory_entries: 200
+    max_artifact_age_days: null
+    max_run_event_age_days: null
+    max_memory_entry_age_days: null
+  cleanup:
+    dry_run_default: false
+    interval_seconds: null
 limits:
   max_steps: 20
   max_runtime_sec: 120
