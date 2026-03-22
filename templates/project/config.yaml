@@ -1,0 +1,18 @@
+mode: project
+workspace:
+  root: .
+llm:
+  provider: codex
+http:
+  allowlist:
+    - example.com
+server:
+  host: 127.0.0.1
+  port: 4310
+worker:
+  poll_interval_ms: 2000
+limits:
+  max_steps: 20
+  max_runtime_sec: 120
+  max_files_changed: 50
+  max_iterations: 3

@@ -1,0 +1,43 @@
+{
+  "name": "@devandtravel/flow",
+  "version": "0.1.0",
+  "description": "Tool-first multi-agent runtime platform for deterministic task execution.",
+  "license": "MIT",
+  "type": "commonjs",
+  "packageManager": "pnpm@9.15.4",
+  "bin": {
+    "agent": "dist/packages/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "docker",
+    "scripts",
+    "templates"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "lint": "eslint . --ext .ts",
+    "format": "prettier --write .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "commander": "^13.1.0",
+    "dotenv": "^16.4.7",
+    "drizzle-orm": "^0.44.5",
+    "pino": "^9.7.0",
+    "undici": "^7.8.0",
+    "yaml": "^2.8.1",
+    "zod": "^3.24.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@typescript-eslint/eslint-plugin": "^8.30.1",
+    "@typescript-eslint/parser": "^8.30.1",
+    "eslint": "^8.57.1",
+    "prettier": "^3.5.3",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}
