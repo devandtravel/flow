@@ -1,46 +1,54 @@
 import { z } from 'zod';
-import type { MemorySummary, TaskPlan, ToolStep } from '../../domain';
-import { criticReviewSchema, evaluationSchema, supervisorDecisionSchema, taskPlanSchema } from '../../domain';
+import type { CriticReview, MemorySummary, TaskPlan, ToolStep } from '../../domain';
+import { evaluationSchema, supervisorDecisionSchema } from '../../domain';
 import type { LlmProvider } from '../../llm';
-import { buildCriticPrompt, buildEvaluatorPrompt, buildPlanningPrompt, buildSupervisorPrompt } from '../../llm/contracts';
+import {
+  buildCriticPrompt,
+  buildEvaluatorPrompt,
+  buildPlanningPrompt,
+  buildSupervisorPrompt,
+  criticReviewResponseSchema,
+  encodeCriticReviewResponse,
+  decodeCriticReviewResponse,
+  decodeTaskPlanResponse,
+  taskPlanResponseSchema,
+} from '../../llm/contracts';
 import type { ToolDefinition, ToolResult } from '../../tools';
-
-const reviewerSchema = z.object({
-  valid: z.boolean(),
-  feedback: z.array(z.string()).default([]),
-  plan: taskPlanSchema,
-});
 
 export class PlannerAgent {
   constructor(private readonly provider: LlmProvider) {}
 
   async generate(input: { goal: string; memory: MemorySummary; tools: ToolDefinition[]; extraContext: string }): Promise<TaskPlan> {
-    return this.provider.complete({
+    const response = await this.provider.complete({
       prompt: buildPlanningPrompt(input.goal, input.memory, input.tools, input.extraContext),
-      schema: taskPlanSchema,
+      schema: taskPlanResponseSchema,
       contract: 'task_plan',
     });
+    return decodeTaskPlanResponse(response);
   }
 }
 
 export class CriticAgent {
   constructor(private readonly provider: LlmProvider) {}
 
-  async validate(plan: TaskPlan, availableTools: ToolDefinition[]): Promise<z.infer<typeof criticReviewSchema>> {
+  async validate(plan: TaskPlan, availableTools: ToolDefinition[]): Promise<CriticReview> {
     const unknownTool = plan.steps.find((step) => availableTools.every((tool) => tool.name !== step.tool));
     if (unknownTool) {
-      return criticReviewSchema.parse({
+      return decodeCriticReviewResponse(
+        encodeCriticReviewResponse({
         valid: false,
         feedback: [`Unknown tool in plan: ${unknownTool.tool}`],
-        plan,
-      });
+          plan,
+        }),
+      );
     }
 
-    return this.provider.complete({
+    const response = await this.provider.complete({
       prompt: buildCriticPrompt(plan, availableTools),
-      schema: reviewerSchema,
+      schema: criticReviewResponseSchema,
       contract: 'critic_review',
     });
+    return decodeCriticReviewResponse(response);
   }
 }
 

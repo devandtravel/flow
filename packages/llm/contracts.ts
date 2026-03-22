@@ -1,8 +1,53 @@
-import type { MemorySummary, TaskPlan } from '../domain';
+import { z } from 'zod';
+import {
+  criticReviewSchema,
+  type CriticReview,
+  type MemorySummary,
+  type TaskPlan,
+  taskPlanSchema,
+} from '../domain';
 import type { ToolDefinition } from '../tools';
 import type { LlmContract } from './index';
 
 export const promptContractVersion = 'v1';
+
+function isValidJsonObjectString(value: string): boolean {
+  try {
+    parseJsonObjectString(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const jsonObjectStringSchema = z.string().min(2).refine(isValidJsonObjectString, {
+  message: 'Expected a valid JSON object string.',
+});
+
+export const toolStepResponseSchema = z.object({
+  tool: z.string().min(1),
+  input_json: jsonObjectStringSchema,
+  expected_json: jsonObjectStringSchema,
+  rationale: z.string().min(1),
+});
+export type ToolStepResponse = z.infer<typeof toolStepResponseSchema>;
+
+export const taskPlanResponseSchema = z.object({
+  goal: z.string().min(1),
+  assumptions: z.array(z.string()).default([]),
+  risks: z.array(z.string()).default([]),
+  steps: z.array(toolStepResponseSchema).min(1),
+  done: z.boolean(),
+  confidence: z.number().min(0).max(1),
+});
+export type TaskPlanResponse = z.infer<typeof taskPlanResponseSchema>;
+
+export const criticReviewResponseSchema = z.object({
+  valid: z.boolean(),
+  feedback: z.array(z.string()).default([]),
+  plan: taskPlanResponseSchema,
+});
+export type CriticReviewResponse = z.infer<typeof criticReviewResponseSchema>;
 
 function sanitizeToolCatalog(tools: ToolDefinition[]) {
   return tools.map((tool) => ({
@@ -13,6 +58,63 @@ function sanitizeToolCatalog(tools: ToolDefinition[]) {
     reversibility: tool.reversibility,
     approvalClass: tool.approvalClass,
   }));
+}
+
+function parseJsonObjectString(value: string): Record<string, unknown> {
+  const parsed = JSON.parse(value);
+  return z.record(z.string(), z.unknown()).parse(parsed);
+}
+
+function stringifyJsonObject(value: Record<string, unknown>): string {
+  return JSON.stringify(value);
+}
+
+export function encodeTaskPlanResponse(plan: TaskPlan): TaskPlanResponse {
+  return taskPlanResponseSchema.parse({
+    goal: plan.goal,
+    assumptions: plan.assumptions,
+    risks: plan.risks,
+    steps: plan.steps.map((step) => ({
+      tool: step.tool,
+      input_json: stringifyJsonObject(step.input),
+      expected_json: stringifyJsonObject(step.expected),
+      rationale: step.rationale,
+    })),
+    done: plan.done,
+    confidence: plan.confidence,
+  });
+}
+
+export function decodeTaskPlanResponse(response: TaskPlanResponse): TaskPlan {
+  return taskPlanSchema.parse({
+    goal: response.goal,
+    assumptions: response.assumptions,
+    risks: response.risks,
+    steps: response.steps.map((step) => ({
+      tool: step.tool,
+      input: parseJsonObjectString(step.input_json),
+      expected: parseJsonObjectString(step.expected_json),
+      rationale: step.rationale,
+    })),
+    done: response.done,
+    confidence: response.confidence,
+  });
+}
+
+export function encodeCriticReviewResponse(review: CriticReview): CriticReviewResponse {
+  return criticReviewResponseSchema.parse({
+    valid: review.valid,
+    feedback: review.feedback,
+    plan: encodeTaskPlanResponse(review.plan),
+  });
+}
+
+export function decodeCriticReviewResponse(response: CriticReviewResponse): CriticReview {
+  return criticReviewSchema.parse({
+    valid: response.valid,
+    feedback: response.feedback,
+    plan: decodeTaskPlanResponse(response.plan),
+  });
 }
 
 export function createJsonSchema(contract: LlmContract): Record<string, unknown> {
@@ -31,11 +133,11 @@ export function createJsonSchema(contract: LlmContract): Record<string, unknown>
           items: {
             type: 'object',
             additionalProperties: false,
-            required: ['tool', 'input', 'expected', 'rationale'],
+            required: ['tool', 'input_json', 'expected_json', 'rationale'],
             properties: {
               tool: { type: 'string' },
-              input: { type: 'object', additionalProperties: true },
-              expected: { type: 'object', additionalProperties: true },
+              input_json: { type: 'string' },
+              expected_json: { type: 'string' },
               rationale: { type: 'string' },
             },
           },
@@ -91,6 +193,9 @@ export function buildPlanningPrompt(goal: string, memory: MemorySummary, tools: 
     `FLOW Contract Version: ${promptContractVersion}`,
     'You are FLOW planner.',
     'Return JSON only.',
+    'You are planning for the FLOW runtime, not executing tools yourself.',
+    'Ignore the Codex session sandbox or approval mode. They do not limit FLOW tool execution.',
+    'Do not reject write-capable FLOW tools solely because your own session is read-only.',
     '',
     `Goal: ${goal}`,
     `ExtraContext: ${extraContext}`,
@@ -102,6 +207,9 @@ export function buildPlanningPrompt(goal: string, memory: MemorySummary, tools: 
     '- keep steps small and verifiable',
     '- prefer reversible actions',
     '- provide rationale for every step',
+    '- encode each step input and expected value as a compact valid JSON object string in input_json and expected_json',
+    '- use only concrete JSON values with double-quoted keys and string literals',
+    '- never output pseudo-types, placeholders, unions, comments, angle brackets, or schema notation inside input_json or expected_json',
   ].join('\n');
 }
 
@@ -110,6 +218,9 @@ export function buildCriticPrompt(plan: TaskPlan, tools: ToolDefinition[]): stri
     `FLOW Contract Version: ${promptContractVersion}`,
     'You are FLOW critic.',
     'Return JSON only.',
+    'You are validating a FLOW runtime plan, not executing tools yourself.',
+    'Ignore the Codex session sandbox or approval mode. They do not limit FLOW tool execution.',
+    'A write-capable step is valid when it uses an allowed FLOW tool and follows the task constraints.',
     `Plan: ${JSON.stringify(plan)}`,
     `AvailableTools: ${JSON.stringify(sanitizeToolCatalog(tools))}`,
     'If the plan is invalid, preserve it and explain the problem in feedback.',

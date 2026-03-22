@@ -6,7 +6,10 @@ import { z } from 'zod';
 import type { RuntimeConfig } from '../config';
 import type { TaskPlan, ToolStep } from '../domain';
 import { InvalidOperationError } from '../errors';
-import { createJsonSchema } from './contracts';
+import {
+  createJsonSchema,
+  encodeTaskPlanResponse,
+} from './contracts';
 
 export const llmContractSchema = z.enum(['task_plan', 'critic_review', 'supervisor_decision', 'evaluation']);
 export type LlmContract = z.infer<typeof llmContractSchema>;
@@ -105,7 +108,7 @@ export class MockLlmProvider implements LlmProvider {
       return request.schema.parse({
         valid: true,
         feedback: [],
-        plan: parsedPlan,
+        plan: encodeTaskPlanResponse(parsedPlan),
       });
     }
 
@@ -131,7 +134,7 @@ export class MockLlmProvider implements LlmProvider {
 
     const goalMatch = request.prompt.match(/Goal:\s*(.+)/i);
     const goal = goalMatch ? goalMatch[1].trim() : 'unknown goal';
-    return request.schema.parse(createHeuristicPlan(goal));
+    return request.schema.parse(encodeTaskPlanResponse(createHeuristicPlan(goal)));
   }
 }
 

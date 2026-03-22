@@ -787,23 +787,46 @@ export class AgentRuntime {
 
       const planSource = await this.resolveApprovedStep(task);
       if (!planSource.approval) {
-        lastPlan = await this.planTask(task, target);
-        const review = await this.critic.validate(lastPlan, listToolDefinitions(this.tools).filter((tool) => target.capabilities.includes(tool.capability)));
-        lastPlan = review.plan;
-        task = this.transitionTask(task, 'validating');
-        this.transitionRun(this.database.getRun(run.id) ?? run, 'validating');
+        try {
+          lastPlan = await this.planTask(task, target);
+          const review = await this.critic.validate(lastPlan, listToolDefinitions(this.tools).filter((tool) => target.capabilities.includes(tool.capability)));
+          lastPlan = review.plan;
+          task = this.transitionTask(task, 'validating');
+          this.transitionRun(this.database.getRun(run.id) ?? run, 'validating');
 
-        if (!review.valid) {
-          this.metrics.recordFailure('plan_validation');
-          this.memory.recordFailure(`plan:${run.id}`, { reason: review.feedback.join('; ') || 'Plan validation failed.' });
-          this.database.createRunEvent(run.id, 'error', 'plan_invalid', { feedback: review.feedback });
+          if (!review.valid) {
+            this.metrics.recordFailure('plan_validation');
+            this.memory.recordFailure(`plan:${run.id}`, { reason: review.feedback.join('; ') || 'Plan validation failed.' });
+            this.database.createRunEvent(run.id, 'error', 'plan_invalid', { feedback: review.feedback });
+            this.database.finishRun(run.id, 'failed');
+            task = this.database.updateTaskState(task.id, 'failed');
+            const decision = await this.supervisor.decide({
+              hadFailure: true,
+              iteration,
+              maxIterations: this.config.limits.max_iterations,
+              failures: review.feedback,
+            });
+            if (decision.decision === 'replan' || decision.decision === 'retry_same_step') {
+              this.metrics.recordRetry();
+              task = this.transitionTask(task, 'retryable');
+              continue;
+            }
+
+            task = this.transitionTask(task, 'escalated');
+            break;
+          }
+        } catch (error) {
+          const failureMessage = error instanceof Error ? error.message : 'Plan generation failed.';
+          this.metrics.recordFailure('plan_generation');
+          this.memory.recordFailure(`plan:${run.id}`, { reason: failureMessage });
+          this.database.createRunEvent(run.id, 'error', 'plan_generation_failed', { error: failureMessage });
           this.database.finishRun(run.id, 'failed');
           task = this.database.updateTaskState(task.id, 'failed');
           const decision = await this.supervisor.decide({
             hadFailure: true,
             iteration,
             maxIterations: this.config.limits.max_iterations,
-            failures: review.feedback,
+            failures: [failureMessage],
           });
           if (decision.decision === 'replan' || decision.decision === 'retry_same_step') {
             this.metrics.recordRetry();
