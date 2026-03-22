@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import pino, { type Logger } from 'pino';
 
@@ -45,9 +45,6 @@ export class MetricsCollector {
 export function createLogger(logsDirectory: string): Logger {
   mkdirSync(logsDirectory, { recursive: true });
   const destination = path.join(logsDirectory, 'runtime.log');
-  if (!existsSync(logsDirectory)) {
-    mkdirSync(logsDirectory, { recursive: true });
-  }
 
   return pino(
     {
