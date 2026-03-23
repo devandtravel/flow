@@ -57,30 +57,50 @@ button {
 
 .layout {
   display: grid;
-  grid-template-columns: 360px minmax(0, 1fr);
+  grid-template-columns: clamp(304px, 22vw, 360px) minmax(0, 1fr);
   min-height: 100vh;
 }
 
 .sidebar,
 .content {
   padding: 28px;
+  min-width: 0;
 }
 
 .sidebar {
   background: rgba(6, 11, 18, 0.7);
   border-right: 1px solid rgba(255, 255, 255, 0.05);
   backdrop-filter: blur(20px);
+  display: grid;
+  align-content: start;
+  gap: 20px;
+  overflow: hidden;
 }
 
 .content {
   display: grid;
   gap: 20px;
+  min-width: 0;
+  align-content: start;
+}
+
+.layout > *,
+.sidebar > *,
+.content > *,
+.grid > *,
+.grid.two > *,
+.split > *,
+.filter-grid > *,
+.status-strip > *,
+.kpi-grid > * {
+  min-width: 0;
 }
 
 .brand,
 .stack {
   display: grid;
   gap: 12px;
+  min-width: 0;
 }
 
 .gap-xs {
@@ -97,6 +117,14 @@ button {
 .muted,
 .meta {
   color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.brand h1 {
+  font-size: clamp(42px, 5vw, 64px);
+  line-height: 0.96;
+  letter-spacing: -0.04em;
+  overflow-wrap: anywhere;
 }
 
 .eyebrow {
@@ -112,6 +140,9 @@ button {
   border-radius: var(--radius-xl);
   padding: 20px;
   box-shadow: var(--shadow-md);
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .panel-accent {
@@ -162,6 +193,7 @@ button {
   flex-wrap: wrap;
   gap: 10px;
   align-items: center;
+  min-width: 0;
 }
 
 .toolbar.spread {
@@ -171,6 +203,7 @@ button {
 .field {
   display: grid;
   gap: 6px;
+  min-width: 0;
 }
 
 .field label {
@@ -182,6 +215,7 @@ button {
 .field textarea,
 .field select {
   width: 100%;
+  max-width: 100%;
   border: 1px solid var(--border);
   border-radius: 14px;
   background: rgba(8, 14, 20, 0.62);
@@ -308,6 +342,9 @@ button {
   background: rgba(8, 14, 20, 0.48);
   border-radius: var(--radius-lg);
   padding: 14px;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .card-soft {
@@ -341,10 +378,12 @@ button {
   justify-content: space-between;
   gap: 12px;
   align-items: flex-start;
+  min-width: 0;
 }
 
 .card-title strong {
   display: block;
+  overflow-wrap: anywhere;
 }
 
 .mono,
@@ -559,11 +598,12 @@ pre {
   display: grid;
   gap: 20px;
   grid-template-columns: minmax(0, 360px) minmax(0, 1fr);
+  align-items: start;
 }
 
 @media (max-width: 1280px) {
   .layout {
-    grid-template-columns: 320px minmax(0, 1fr);
+    grid-template-columns: clamp(280px, 28vw, 320px) minmax(0, 1fr);
   }
 
   .status-strip,
@@ -576,7 +616,7 @@ pre {
   }
 }
 
-@media (max-width: 1120px) {
+@media (max-width: 1320px) {
   .layout,
   .grid.two,
   .split {
