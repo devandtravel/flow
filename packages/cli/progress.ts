@@ -57,7 +57,14 @@ function formatRunEventMessage(event: Extract<RuntimeUpdateEvent, { kind: 'run_e
   switch (event.message) {
     case 'run_started': {
       const iteration = getNumberValue(payload, 'iteration');
-      return iteration === undefined ? 'Запуск начат.' : `Запуск начат. Итерация ${String(iteration)}.`;
+      const maxIterations = getNumberValue(payload, 'maxIterations');
+      if (iteration === undefined) {
+        return 'Запуск начат.';
+      }
+
+      return maxIterations === undefined
+        ? `Запуск начат. Попытка ${String(iteration)}.`
+        : `Запуск начат. Попытка ${String(iteration)}/${String(maxIterations)}.`;
     }
     case 'planning_started':
       return 'Планирование начато.';
@@ -77,8 +84,19 @@ function formatRunEventMessage(event: Extract<RuntimeUpdateEvent, { kind: 'run_e
       }
       return `Планирование завершено, ${parts.join(', ')}.`;
     }
-    case 'plan_invalid':
-      return 'План отклонён критиком.';
+    case 'plan_invalid': {
+      const feedback = payload['feedback'];
+      if (!Array.isArray(feedback)) {
+        return 'План отклонён критиком.';
+      }
+
+      const feedbackItems = feedback.filter((item): item is string => typeof item === 'string');
+      if (feedbackItems.length === 0) {
+        return 'План отклонён критиком.';
+      }
+
+      return `План отклонён критиком. ${feedbackItems[0]}`;
+    }
     case 'plan_generation_failed':
       return 'Планирование завершилось ошибкой.';
     case 'step_started': {

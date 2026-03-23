@@ -64,6 +64,40 @@ function getExpectedValidationError(step: ToolStep): string | undefined {
   return undefined;
 }
 
+function getPatchValidationError(step: ToolStep): string | undefined {
+  if (step.tool !== 'repo.apply_patch') {
+    return undefined;
+  }
+
+  const patch = step.input['patch'];
+  if (typeof patch !== 'string' || patch.trim().length === 0) {
+    return 'patch must contain a non-empty diff or FLOW patch.';
+  }
+
+  const lines = patch.replaceAll('\r\n', '\n').split('\n');
+  if (lines.some((line) => line.trim() === '...')) {
+    return 'patch must not contain ellipses or omitted context markers.';
+  }
+
+  const firstLine = lines[0]?.trim() ?? '';
+  if (firstLine.startsWith('*** Update File:')) {
+    const nextMeaningfulLine = lines
+      .slice(1)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+
+    if (!nextMeaningfulLine || !nextMeaningfulLine.startsWith('@@')) {
+      return 'FLOW update patch must contain an explicit @@ hunk after the update header.';
+    }
+  }
+
+  return undefined;
+}
+
 export function getStepSemanticValidationError(step: ToolStep): string | undefined {
-  return getWriteFileContentValidationError(step) ?? getExpectedValidationError(step);
+  return (
+    getWriteFileContentValidationError(step) ??
+    getExpectedValidationError(step) ??
+    getPatchValidationError(step)
+  );
 }

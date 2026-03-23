@@ -24,6 +24,24 @@ function describeFailures(failures: string[]): string {
   return failures.join('; ');
 }
 
+function createFallbackSupervisorDecision(input: {
+  iteration: number;
+  maxIterations: number;
+  failures: string[];
+}): z.infer<typeof supervisorDecisionSchema> {
+  if (input.iteration >= input.maxIterations) {
+    return supervisorDecisionSchema.parse({
+      decision: 'escalate',
+      reason: `Maximum iterations reached with failures: ${describeFailures(input.failures)}.`,
+    });
+  }
+
+  return supervisorDecisionSchema.parse({
+    decision: 'replan',
+    reason: `Structured supervisor response was unavailable. Replanning after failure: ${describeFailures(input.failures)}.`,
+  });
+}
+
 export class PlannerAgent {
   constructor(private readonly provider: LlmProvider) {}
 
@@ -191,22 +209,23 @@ export class SupervisorAgent {
     }
 
     if (input.iteration >= input.maxIterations) {
-      return supervisorDecisionSchema.parse({
-        decision: 'escalate',
-        reason: `Maximum iterations reached with failures: ${describeFailures(input.failures)}.`,
-      });
+      return createFallbackSupervisorDecision(input);
     }
 
-    return this.provider.complete({
-      prompt: buildSupervisorPrompt({
-        hadFailure: input.hadFailure,
-        iteration: input.iteration,
-        maxIterations: input.maxIterations,
-        failures: input.failures,
-      }),
-      schema: supervisorDecisionSchema,
-      contract: 'supervisor_decision',
-    });
+    try {
+      return await this.provider.complete({
+        prompt: buildSupervisorPrompt({
+          hadFailure: input.hadFailure,
+          iteration: input.iteration,
+          maxIterations: input.maxIterations,
+          failures: input.failures,
+        }),
+        schema: supervisorDecisionSchema,
+        contract: 'supervisor_decision',
+      });
+    } catch {
+      return createFallbackSupervisorDecision(input);
+    }
   }
 }
 

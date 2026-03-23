@@ -227,6 +227,15 @@ function parseFlowPatch(patch: string): FlowPatchOperation[] {
   return operations;
 }
 
+export function validateFlowPatch(patch: string): string | undefined {
+  try {
+    parseFlowPatch(patch);
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : 'Invalid FLOW patch.';
+  }
+}
+
 function findAllMatches(haystack: string[], needle: string[]): number[] {
   if (needle.length === 0) {
     return [];

@@ -1,10 +1,12 @@
 import { dashboardArtifactViewsScript } from './artifacts';
 import { dashboardCopyScript } from './copy';
 import { dashboardRouteStateScript } from './routes';
+import { dashboardRunInsightsScript } from './run-insights';
 import { dashboardTaskViewsScript } from './task-views';
 
 export const dashboardScript = `
 ${dashboardCopyScript}
+${dashboardRunInsightsScript}
 
 const terminalStates = ['completed', 'failed', 'escalated', 'blocked', 'cancelled', 'rolled_back'];
 const storageKeys = {
@@ -557,66 +559,6 @@ function collectRunChangedFiles(run) {
   });
 }
 
-function renderRunSummaryCard(runEntry) {
-  const run = runEntry.run;
-  const summary = runEntry.summary;
-  return [
-    '<button type="button" class="card stack run-summary-card" data-run-id="' + escapeHtml(run.id) + '">',
-    '<div class="toolbar spread">',
-    '<div class="stack gap-xs">',
-    '<div class="eyebrow">Run ' + String(run.iteration + 1) + '</div>',
-    '<strong class="mono">' + escapeHtml(run.id) + '</strong>',
-    '</div>',
-    renderPill(getStateLabel(run.status), getStateTone(run.status)),
-    '</div>',
-    createKeyFacts([
-      { label: 'completed steps', value: String(summary.completedSteps) },
-      { label: 'failed steps', value: String(summary.failedSteps) },
-      { label: 'changed files', value: String(summary.changedFiles.length) },
-      { label: 'score', value: summary.score === null ? 'n/a' : String(summary.score) },
-    ]),
-    summary.latestEventTitle
-      ? '<div class="meta">Последний сигнал: ' + escapeHtml(summary.latestEventTitle) + '</div>'
-      : '<div class="meta">События ещё не записаны.</div>',
-    '</button>',
-  ].join('');
-}
-
-function renderTaskHeader(taskView) {
-  const latestRun = Array.isArray(taskView.runs) && taskView.runs.length > 0 ? taskView.runs[0] : null;
-  const summary = taskView.summary && typeof taskView.summary === 'object' ? taskView.summary : null;
-
-  return [
-    '<section class="panel stack task-header-panel">',
-    '<div class="toolbar spread">',
-    '<div class="stack gap-xs">',
-    '<div class="eyebrow">' + escapeHtml(copy.selectedTask) + '</div>',
-    '<h2>' + escapeHtml(taskView.task.goal) + '</h2>',
-    '<div class="meta mono">' + escapeHtml(taskView.task.id) + '</div>',
-    '</div>',
-    renderPill(getStateLabel(taskView.task.state), getStateTone(taskView.task.state)),
-    '</div>',
-    '<div class="summary-text">' +
-      escapeHtml(
-        summary && summary.latestRunId
-          ? 'Последний run: ' + getStateLabel(summary.latestRunState || 'queued') + ', ' + String(summary.latestRunCompletedSteps) + ' подтверждённых шагов и ' + String(summary.latestRunChangedFiles) + ' изменённых файлов.'
-          : 'Задача создана, но run ещё не стартовал.',
-      ) +
-    '</div>',
-    createKeyFacts([
-      { label: 'target', value: taskView.task.target_id },
-      { label: 'updated', value: formatRelativeTime(summary ? summary.updatedAt : taskView.task.updated_at) },
-      { label: 'runs', value: String(taskView.runsPage.total) },
-      { label: 'approvals', value: String(Array.isArray(taskView.approvals) ? taskView.approvals.length : 0) },
-    ]),
-    renderTaskActions(taskView.actions, taskView.task.id),
-    latestRun
-      ? '<section class="stack"><div class="section-heading">Сводка запусков</div><div class="grid two">' + taskView.runs.map(renderRunSummaryCard).join('') + '</div></section>'
-      : '',
-    '</section>',
-  ].join('');
-}
-
 function describeTaskState(tasks) {
   const activeTask = tasks.find((task) => !terminalStates.includes(task.state));
   if (activeTask) {
@@ -709,10 +651,27 @@ function describeEvent(event) {
     const confidence = payload && typeof payload.confidence === 'number' ? String(payload.confidence) : '';
     return {
       title: 'План подготовлен',
-      summary: 'План валиден и готов к исполнению.',
+      summary: 'План подготовлен и передан на проверку.',
       facts: [
         { label: 'steps', value: steps },
         { label: 'confidence', value: confidence },
+      ],
+      raw: payload,
+    };
+  }
+  if (event.message === 'plan_invalid') {
+    const feedback = payload && Array.isArray(payload.feedback)
+      ? payload.feedback.filter((item) => typeof item === 'string')
+      : [];
+    const doNotRepeatRules = payload && Array.isArray(payload.doNotRepeatRules)
+      ? payload.doNotRepeatRules.filter((item) => typeof item === 'string')
+      : [];
+    return {
+      title: 'План отклонён проверкой',
+      summary: feedback[0] || 'Проверка плана завершилась отклонением. Ожидается повторное построение.',
+      facts: [
+        { label: 'feedback', value: String(feedback.length) },
+        { label: 'rules', value: String(doNotRepeatRules.length) },
       ],
       raw: payload,
     };

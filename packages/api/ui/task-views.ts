@@ -5,7 +5,7 @@ function renderRun(run) {
     '<section class="panel stack">',
     '<div class="toolbar spread">',
     '<div class="stack gap-xs">',
-    '<div class="eyebrow">Запуск ' + String(run.iteration + 1) + '</div>',
+    '<div class="eyebrow">' + escapeHtml(run.attemptLabel || ('Попытка ' + String(run.iteration))) + '</div>',
     '<h3 class="mono">' + escapeHtml(run.id) + '</h3>',
     '<div class="meta">Старт: ' + escapeHtml(formatDateTime(run.started_at)) + '</div>',
     '</div>',
@@ -76,12 +76,15 @@ function renderRunPage(runView) {
     '</div>',
     createKeyFacts([
       { label: 'task', value: runView.task.id },
+      { label: copy.attempt, value: runView.summary.attempt.label },
       { label: 'подтверждённые шаги', value: String(runView.summary.completedSteps) },
       { label: 'ошибки шагов', value: String(runView.summary.failedSteps) },
       { label: 'изменённые файлы', value: String(runView.summary.changedFiles.length) },
       { label: 'score', value: runView.summary.score === null ? 'n/a' : String(runView.summary.score) },
     ]),
     renderTaskActions(runView.taskActions, runView.task.id),
+    renderPlanPreviewBlock(runView.summary),
+    renderCriticFeedbackBlock(runView.summary),
     runView.summary.changedFiles.length > 0
       ? '<div><div class="section-heading">Изменённые файлы</div>' + createBulletList(runView.summary.changedFiles) + '</div>'
       : '',
@@ -91,6 +94,7 @@ function renderRunPage(runView) {
       id: runView.run.id,
       status: runView.run.status,
       iteration: runView.run.iteration,
+      attemptLabel: runView.summary.attempt.label,
       started_at: runView.run.started_at,
       events: runView.events,
       steps: runView.steps,

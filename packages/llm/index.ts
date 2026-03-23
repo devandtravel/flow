@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -22,6 +22,10 @@ export interface LlmRequest<TOutput> {
 
 export interface LlmProvider {
   complete<TOutput>(request: LlmRequest<TOutput>): Promise<TOutput>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 export function extractJsonObjectFromStdout(stdout: string): string | undefined {
@@ -57,6 +61,23 @@ export function extractJsonObjectFromStdout(stdout: string): string | undefined 
   }
 
   return undefined;
+}
+
+function extractJsonObjectCandidates(text: string): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  for (let start = text.lastIndexOf('{'); start >= 0; start = text.lastIndexOf('{', start - 1)) {
+    const candidate = findJsonObjectAt(text, start);
+    if (!candidate || seen.has(candidate)) {
+      continue;
+    }
+
+    seen.add(candidate);
+    candidates.push(candidate);
+  }
+
+  return candidates;
 }
 
 function extractLastJsonObjectCandidate(text: string): string | undefined {
@@ -118,15 +139,87 @@ function findJsonObjectAt(text: string, startIndex: number): string | undefined 
   return undefined;
 }
 
-function getStructuredOutputCandidate(
+function getStructuredOutputCandidates(
   outputPath: string,
   execution: { stdout: string; stderr: string },
-): string {
+): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
   if (existsSync(outputPath)) {
-    return readFileSync(outputPath, 'utf8');
+    const outputFileContent = readFileSync(outputPath, 'utf8');
+    if (outputFileContent.length > 0) {
+      candidates.push(outputFileContent);
+      seen.add(outputFileContent);
+    }
   }
 
-  return extractJsonObjectFromStdout(execution.stdout) ?? extractJsonObjectFromStdout(execution.stderr) ?? '';
+  for (const candidate of extractJsonObjectCandidates(execution.stdout)) {
+    if (seen.has(candidate)) {
+      continue;
+    }
+
+    seen.add(candidate);
+    candidates.push(candidate);
+  }
+
+  for (const candidate of extractJsonObjectCandidates(execution.stderr)) {
+    if (seen.has(candidate)) {
+      continue;
+    }
+
+    seen.add(candidate);
+    candidates.push(candidate);
+  }
+
+  return candidates;
+}
+
+function matchesContractSignature(contract: LlmContract, value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  if (contract === 'task_plan') {
+    return 'goal' in value && 'steps' in value && 'done' in value && 'confidence' in value;
+  }
+
+  if (contract === 'critic_review') {
+    return 'valid' in value && 'feedback' in value && 'plan' in value;
+  }
+
+  if (contract === 'supervisor_decision') {
+    return 'decision' in value && 'reason' in value;
+  }
+
+  return 'score' in value && 'issues' in value && 'suggestions' in value;
+}
+
+function buildStructuredOutputRetryPrompt(basePrompt: string): string {
+  return [
+    basePrompt,
+    '',
+    'The previous attempt did not satisfy the structured output contract.',
+    'Return exactly one JSON object that matches the schema and do not add prose, commentary, or markdown.',
+  ].join('\n');
+}
+
+function createIsolatedCodexHome(rootDirectory: string): string {
+  const codexHome = path.join(rootDirectory, 'codex-home');
+  mkdirSync(codexHome, { recursive: true });
+  writeFileSync(
+    path.join(codexHome, 'config.toml'),
+    [
+      'approval_policy = "never"',
+      'sandbox_mode = "read-only"',
+      '[features]',
+      'apps = false',
+      'tui_app_server = false',
+      'multi_agent = false',
+    ].join('\n'),
+    'utf8',
+  );
+  return codexHome;
 }
 
 function createHeuristicPlan(goal: string): TaskPlan {
@@ -252,26 +345,41 @@ export class CodexProvider implements LlmProvider {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const outputDirectory = mkdtempSync(path.join(os.tmpdir(), 'flow-codex-'));
+      const codexHome = createIsolatedCodexHome(outputDirectory);
       const outputPath = path.join(outputDirectory, 'response.json');
       const schemaPath = path.join(outputDirectory, 'schema.json');
       writeFileSync(schemaPath, JSON.stringify(createJsonSchema(request.contract), null, 2));
+      const prompt = attempt === 1 ? request.prompt : buildStructuredOutputRetryPrompt(request.prompt);
       const args = [
         'exec',
         '--skip-git-repo-check',
         '--sandbox',
         'read-only',
+        '--ephemeral',
+        '-c',
+        'mcp_servers={}',
+        '-c',
+        'features.apps=false',
+        '-c',
+        'features.tui_app_server=false',
+        '-c',
+        'model_reasoning_effort="medium"',
         '--output-schema',
         schemaPath,
         '--output-last-message',
         outputPath,
         '--model',
         this.config.model,
-        request.prompt,
+        prompt,
       ];
 
       const execution = spawnSync(this.config.executable, args, {
         encoding: 'utf8',
         timeout: this.config.timeout_ms,
+        env: {
+          ...process.env,
+          CODEX_HOME: codexHome,
+        },
       });
 
       if (execution.status !== 0) {
@@ -290,8 +398,8 @@ export class CodexProvider implements LlmProvider {
         throw lastError;
       }
 
-      const raw = getStructuredOutputCandidate(outputPath, execution);
-      if (raw.length === 0) {
+      const rawCandidates = getStructuredOutputCandidates(outputPath, execution);
+      if (rawCandidates.length === 0) {
         lastError = new InvalidOperationError('Codex completed without producing structured output.', {
           executable: this.config.executable,
           model: this.config.model,
@@ -307,28 +415,45 @@ export class CodexProvider implements LlmProvider {
         throw lastError;
       }
 
-      try {
-        const parsed = JSON.parse(raw);
-        return request.schema.parse(parsed);
-      } catch (error) {
-        lastError = new InvalidOperationError(
-          error instanceof Error ? error.message : 'Codex returned invalid structured output.',
-          {
-            executable: this.config.executable,
-            model: this.config.model,
-            stdout: execution.stdout,
-            stderr: execution.stderr,
-            outputPath,
-            raw,
-            attempt,
-            maxAttempts,
-          },
-        );
-        if (attempt < maxAttempts) {
-          continue;
+      for (const raw of rawCandidates) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (!matchesContractSignature(request.contract, parsed)) {
+            continue;
+          }
+          return request.schema.parse(parsed);
+        } catch (error) {
+          lastError = new InvalidOperationError(
+            error instanceof Error ? error.message : 'Codex returned invalid structured output.',
+            {
+              executable: this.config.executable,
+              model: this.config.model,
+              stdout: execution.stdout,
+              stderr: execution.stderr,
+              outputPath,
+              raw,
+              attempt,
+              maxAttempts,
+            },
+          );
         }
-        throw lastError;
       }
+
+      lastError = new InvalidOperationError('Codex completed without a contract-matching structured response.', {
+        executable: this.config.executable,
+        model: this.config.model,
+        stdout: execution.stdout,
+        stderr: execution.stderr,
+        outputPath,
+        attempt,
+        maxAttempts,
+      });
+
+      if (attempt < maxAttempts) {
+        continue;
+      }
+
+      throw lastError;
     }
 
     throw lastError ?? new InvalidOperationError('Codex provider failed without an explicit error.');

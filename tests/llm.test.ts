@@ -1,10 +1,19 @@
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { buildDefaultConfig } from '../packages/config';
 import { CriticAgent, SupervisorAgent } from '../packages/core/agents';
-import { CodexProvider, MockLlmProvider, extractJsonObjectFromStdout } from '../packages/llm';
+import { CodexProvider, MockLlmProvider, extractJsonObjectFromStdout, type LlmProvider, type LlmRequest } from '../packages/llm';
 import { buildPlanningPrompt, createJsonSchema, decodeTaskPlanResponse, taskPlanResponseSchema, toolStepResponseSchema } from '../packages/llm/contracts';
 import { createToolRegistry } from '../packages/tools';
+
+class ThrowingProvider implements LlmProvider {
+  async complete<TOutput>(_request: LlmRequest<TOutput>): Promise<TOutput> {
+    throw new Error('provider unavailable');
+  }
+}
 
 describe('LLM providers', () => {
   it('mock provider returns schema-validated structured output', async () => {
@@ -44,6 +53,42 @@ describe('LLM providers', () => {
         contract: 'evaluation',
       }),
     ).rejects.toThrow();
+  });
+
+  it('codex provider ignores unrelated json blocks and parses the contract-matching response', async () => {
+    const tempDirectory = mkdtempSync(path.join(os.tmpdir(), 'flow-llm-test-'));
+    const executablePath = path.join(tempDirectory, 'mock-codex.js');
+    writeFileSync(
+      executablePath,
+      [
+        '#!/usr/bin/env node',
+        "const fs = require('node:fs');",
+        "const outputIndex = process.argv.indexOf('--output-last-message');",
+        'if (outputIndex >= 0) {',
+        "  fs.writeFileSync(process.argv[outputIndex + 1], '');",
+        '}',
+        "console.log('{\"code\":\"invalid_type\",\"message\":\"Required\"}');",
+        "console.log('{\"goal\":\"demo\",\"assumptions\":[],\"risks\":[],\"steps\":[{\"tool\":\"fs.list_dir\",\"input_json\":\"{\\\\\"path\\\\\":\\\\\".\\\\\"}\",\"expected_json\":\"{\\\\\"success\\\\\":true}\",\"rationale\":\"observe\"}],\"done\":false,\"confidence\":0.5}');",
+      ].join('\n'),
+      'utf8',
+    );
+    chmodSync(executablePath, 0o755);
+
+    const config = buildDefaultConfig('/tmp/flow-llm', 'project');
+    const provider = new CodexProvider({
+      ...config.llm,
+      executable: executablePath,
+    });
+
+    const result = await provider.complete({
+      prompt: 'Return a task plan.',
+      schema: taskPlanResponseSchema,
+      contract: 'task_plan',
+    });
+
+    expect(result.goal).toBe('demo');
+    expect(result.steps).toHaveLength(1);
+    expect(result.steps[0]?.tool).toBe('fs.list_dir');
   });
 
   it('task plan schema is compatible with codex structured output requirements', () => {
@@ -95,6 +140,9 @@ describe('LLM providers', () => {
     expect(prompt).toContain('never use guessed context, placeholder lines, ellipses, or synthetic markers');
     expect(prompt).toContain('for fs.write_file, content must be the complete final file text');
     expect(prompt).toContain('expected_json must describe concrete observable results');
+    expect(prompt).toContain('If ExtraContext contains recentFailureHints');
+    expect(prompt).toContain('If ExtraContext contains recentFailureClasses');
+    expect(prompt).toContain('If ExtraContext contains doNotRepeatRules');
   });
 
   it('critic rejects placeholder fs.write_file content before execution', async () => {
@@ -166,6 +214,41 @@ describe('LLM providers', () => {
     expect(review.feedback[0]).toContain('concrete verification values');
   });
 
+  it('critic rejects speculative FLOW patch bodies before execution', async () => {
+    const registry = createToolRegistry();
+    const patchTool = registry.get('repo.apply_patch');
+    if (!patchTool) {
+      throw new Error('Expected repo.apply_patch tool to be registered.');
+    }
+
+    const critic = new CriticAgent(new MockLlmProvider());
+    const review = await critic.validate(
+      {
+        goal: 'patch readme',
+        assumptions: [],
+        risks: [],
+        steps: [
+          {
+            tool: 'repo.apply_patch',
+            input: {
+              patch: '*** Update File: README.md\n...',
+            },
+            expected: {
+              changed: true,
+            },
+            rationale: 'placeholder patch',
+          },
+        ],
+        done: false,
+        confidence: 0.2,
+      },
+      [patchTool],
+    );
+
+    expect(review.valid).toBe(false);
+    expect(review.feedback[0]).toContain('must not contain ellipses');
+  });
+
   it('rejects pseudo-json tool payloads in task plan steps', () => {
     expect(() =>
       toolStepResponseSchema.parse({
@@ -188,6 +271,19 @@ describe('LLM providers', () => {
 
     expect(decision.decision).toBe('escalate');
     expect(decision.reason).toContain('first failure; second failure');
+  });
+
+  it('supervisor falls back to deterministic replan when provider output is unavailable', async () => {
+    const supervisor = new SupervisorAgent(new ThrowingProvider());
+    const decision = await supervisor.decide({
+      hadFailure: true,
+      iteration: 1,
+      maxIterations: 3,
+      failures: ['planner failed'],
+    });
+
+    expect(decision.decision).toBe('replan');
+    expect(decision.reason).toContain('Structured supervisor response was unavailable');
   });
 
   it('extracts the last JSON object from codex stdout when output file is missing', () => {

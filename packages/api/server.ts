@@ -354,6 +354,7 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
               ...runtime.getTaskView(taskId, page, {
                 status: filter.runStatus,
               }),
+              maxIterations: runtime.config.limits.max_iterations,
               actions: runtime.listTaskOperatorActions(taskId),
             }),
           );
@@ -475,8 +476,16 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
           sendJson(response, 200, runtime.applyTaskOperatorAction(taskId, 'retry'));
           return;
         }
+        if (requestUrl.pathname.endsWith('/actions/retry_with_constraints')) {
+          sendJson(response, 200, runtime.applyTaskOperatorAction(taskId, 'retry_with_constraints'));
+          return;
+        }
         if (requestUrl.pathname.endsWith('/actions/replan')) {
           sendJson(response, 200, runtime.applyTaskOperatorAction(taskId, 'replan'));
+          return;
+        }
+        if (requestUrl.pathname.endsWith('/actions/replan_from_feedback')) {
+          sendJson(response, 200, runtime.applyTaskOperatorAction(taskId, 'replan_from_feedback'));
           return;
         }
         if (requestUrl.pathname.endsWith('/actions/escalate')) {
@@ -529,8 +538,10 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
               runPayload.run,
               runPayload.steps,
               runPayload.events,
+              runPayload.summaryEvents,
               runPayload.evaluations,
               runPayload.eventsPage,
+              runtime.config.limits.max_iterations,
               runtime.listTaskOperatorActions(runPayload.task.id),
             ),
           );
@@ -611,6 +622,9 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
           workerController.abort();
           workerController = undefined;
         }
+        if (typeof server.closeIdleConnections === 'function') {
+          server.closeIdleConnections();
+        }
         server.close((error) => {
           if (error) {
             reject(error);
@@ -618,6 +632,9 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
           }
           resolve();
         });
+        if (typeof server.closeAllConnections === 'function') {
+          server.closeAllConnections();
+        }
       });
     },
   };

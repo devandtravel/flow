@@ -33,6 +33,7 @@ import {
   type ToolExecutionContext,
   type ToolResult,
 } from '../../tools';
+import { buildReplanGuidance } from '../agents/replan-guidance';
 import { CriticAgent, EvaluatorAgent, ExecutorAgent, PlannerAgent, SupervisorAgent, VerifierAgent } from '../agents';
 import { assertValidRunTransition, assertValidStepTransition, assertValidTaskTransition } from '../state';
 
@@ -130,7 +131,13 @@ export interface MaintenanceSummary {
   latestEvent: MaintenanceEventRecord | null;
 }
 
-export type TaskOperatorAction = 'retry' | 'replan' | 'escalate' | 'cancel';
+export type TaskOperatorAction =
+  | 'retry'
+  | 'replan'
+  | 'retry_with_constraints'
+  | 'replan_from_feedback'
+  | 'escalate'
+  | 'cancel';
 
 export type RuntimeUpdateEvent =
   | {
@@ -225,6 +232,30 @@ function createFallbackPlan(goal: string): TaskPlan {
     done: false,
     confidence: 0,
   });
+}
+
+function createPlanPreviewPayload(plan: TaskPlan): Record<string, unknown> {
+  return {
+    assumptions: plan.assumptions,
+    risks: plan.risks,
+    confidence: plan.confidence,
+    steps: plan.steps.map((step) => ({
+      tool: step.tool,
+      rationale: step.rationale,
+    })),
+  };
+}
+
+function getStringArrayValue(payloadJson: string, key: string): string[] {
+  const parsed = JSON.parse(payloadJson);
+  const envelope = z.object({ [key]: z.array(z.string()) }).parse(parsed);
+  return envelope[key];
+}
+
+function getStringValue(payloadJson: string, key: string): string | undefined {
+  const parsed = JSON.parse(payloadJson);
+  const envelope = z.object({ [key]: z.string().optional() }).parse(parsed);
+  return envelope[key];
 }
 
 function normalizeRootPath(rootPath: string): string {
@@ -484,6 +515,17 @@ export class AgentRuntime {
     return this.database.listRunsByTaskPage(taskId, { limit: 1, offset: 0 })[0];
   }
 
+  private latestRunHasPlanFeedback(taskId: string): boolean {
+    const latestRun = this.getLatestRunForTask(taskId);
+    if (!latestRun) {
+      return false;
+    }
+
+    return this.database
+      .listRunEvents(latestRun.id)
+      .some((event) => event.message === 'plan_invalid' || event.message === 'plan_generation_failed');
+  }
+
   private recordTaskOperatorAction(
     taskId: string,
     action: TaskOperatorAction,
@@ -568,6 +610,8 @@ export class AgentRuntime {
   private async planTask(task: TaskRecord, target: TargetConfig): Promise<TaskPlan> {
     const toolCatalog = listToolDefinitions(this.tools).filter((tool) => target.capabilities.includes(tool.capability));
     const memory = this.memory.getContext();
+    const recentFailureHints = this.getRecentTaskFailureHints(task.id);
+    const replanGuidance = buildReplanGuidance(recentFailureHints);
     return this.planner.generate({
       goal: task.goal,
       memory,
@@ -578,8 +622,67 @@ export class AgentRuntime {
           root: target.root,
         },
         autonomy: this.config.autonomy.mode,
+        recentFailureHints,
+        recentFailureClasses: replanGuidance.failureClasses,
+        doNotRepeatRules: replanGuidance.doNotRepeatRules,
       }),
     });
+  }
+
+  private getRecentTaskFailureHints(taskId: string, limit = 5): string[] {
+    const timeline = this.database.getTaskTimeline(taskId, { limit: 5, offset: 0 });
+    const hints: string[] = [];
+
+    for (const run of timeline.runs) {
+      for (const event of run.events) {
+        if (event.message === 'plan_invalid') {
+          const feedback = getStringArrayValue(event.payload_json, 'feedback');
+          for (const item of feedback) {
+            hints.push(`plan_invalid: ${item}`);
+          }
+          continue;
+        }
+
+        if (event.message === 'plan_generation_failed') {
+          const error = getStringValue(event.payload_json, 'error');
+          if (error !== undefined) {
+            hints.push(`plan_generation_failed: ${error}`);
+          }
+          continue;
+        }
+
+        if (event.message === 'supervisor_decision') {
+          const reason = getStringValue(event.payload_json, 'reason');
+          if (reason !== undefined) {
+            hints.push(`supervisor_decision: ${reason}`);
+          }
+        }
+      }
+
+      for (const step of run.steps) {
+        if (step.status !== 'failed' || step.output_json === null) {
+          continue;
+        }
+
+        const parsedOutput = JSON.parse(step.output_json);
+        const resultEnvelope = z
+          .object({
+            verification: z
+              .object({
+                verified: z.boolean(),
+                evidence: z.string(),
+              })
+              .optional(),
+          })
+          .parse(parsedOutput);
+
+        if (resultEnvelope.verification && !resultEnvelope.verification.verified) {
+          hints.push(`${step.tool}: ${resultEnvelope.verification.evidence}`);
+        }
+      }
+    }
+
+    return [...new Set(hints)].slice(0, limit);
   }
 
   private async resolveApprovedStep(task: TaskRecord): Promise<{
@@ -925,6 +1028,7 @@ export class AgentRuntime {
       run,
       steps: this.database.listStepsByRun(runId),
       evaluations: this.database.listEvaluationsByRun(runId),
+      summaryEvents: this.database.listRunEvents(runId),
       eventsPage: eventsPage.page,
       events: eventsPage.events,
     };
@@ -1038,21 +1142,24 @@ export class AgentRuntime {
 
   listTaskOperatorActions(taskId: string): TaskOperatorAction[] {
     const task = this.requireTask(taskId);
+    const useFeedbackActions = this.latestRunHasPlanFeedback(taskId);
+    const retryAction: TaskOperatorAction = useFeedbackActions ? 'retry_with_constraints' : 'retry';
+    const replanAction: TaskOperatorAction = useFeedbackActions ? 'replan_from_feedback' : 'replan';
     switch (task.state) {
       case 'failed':
-        return ['retry', 'replan', 'escalate', 'cancel'];
+        return [retryAction, replanAction, 'escalate', 'cancel'];
       case 'blocked':
-        return ['retry', 'replan', 'escalate', 'cancel'];
+        return [retryAction, replanAction, 'escalate', 'cancel'];
       case 'retryable':
-        return ['replan', 'escalate', 'cancel'];
+        return [replanAction, 'escalate', 'cancel'];
       case 'awaiting_approval':
-        return ['replan', 'cancel'];
+        return [replanAction, 'cancel'];
       case 'queued':
         return ['cancel'];
       case 'escalated':
-        return ['retry', 'replan', 'cancel'];
+        return [retryAction, replanAction, 'cancel'];
       case 'cancelled':
-        return ['replan'];
+        return [replanAction];
       default:
         return [];
     }
@@ -1064,9 +1171,11 @@ export class AgentRuntime {
 
     switch (action) {
       case 'retry':
+      case 'retry_with_constraints':
         nextState = 'retryable';
         break;
       case 'replan':
+      case 'replan_from_feedback':
         nextState = 'queued';
         break;
       case 'escalate':
@@ -1159,7 +1268,12 @@ export class AgentRuntime {
       const run = this.database.createRun(task.id, iteration, 'queued');
       lastRunId = run.id;
       this.transitionRun(run, 'planning');
-      this.createRunEvent(task.id, run.id, 'info', 'run_started', { taskId: task.id, iteration, targetId: task.target_id });
+      this.createRunEvent(task.id, run.id, 'info', 'run_started', {
+        taskId: task.id,
+        iteration,
+        maxIterations: this.config.limits.max_iterations,
+        targetId: task.target_id,
+      });
       this.createRunEvent(task.id, run.id, 'info', 'planning_started', { taskId: task.id, targetId: task.target_id });
 
       const planSource = await this.resolveApprovedStep(task);
@@ -1169,6 +1283,7 @@ export class AgentRuntime {
           this.createRunEvent(task.id, run.id, 'info', 'planning_completed', {
             stepCount: lastPlan.steps.length,
             confidence: lastPlan.confidence,
+            preview: createPlanPreviewPayload(lastPlan),
           });
           const review = await this.critic.validate(lastPlan, listToolDefinitions(this.tools).filter((tool) => target.capabilities.includes(tool.capability)));
           lastPlan = review.plan;
@@ -1178,7 +1293,12 @@ export class AgentRuntime {
           if (!review.valid) {
             this.metrics.recordFailure('plan_validation');
             this.memory.recordFailure(`plan:${run.id}`, { reason: review.feedback.join('; ') || 'Plan validation failed.' });
-            this.createRunEvent(task.id, run.id, 'error', 'plan_invalid', { feedback: review.feedback });
+            const replanGuidance = buildReplanGuidance(review.feedback);
+            this.createRunEvent(task.id, run.id, 'error', 'plan_invalid', {
+              feedback: review.feedback,
+              failureClasses: replanGuidance.failureClasses,
+              doNotRepeatRules: replanGuidance.doNotRepeatRules,
+            });
             this.finishRun(run, 'failed');
             task = this.transitionTask(task, 'failed');
             const decision = await this.supervisor.decide({
@@ -1360,6 +1480,8 @@ export class AgentRuntime {
         this.createRunEvent(task.id, run.id, verification.verified ? 'info' : 'error', 'step_completed', {
           step: step.tool,
           verified: verification.verified,
+          evidence: verification.evidence,
+          changedFiles: result.changedFiles,
         });
 
         for (const changedFile of result.changedFiles) {

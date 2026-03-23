@@ -134,8 +134,16 @@ describe('API server', () => {
             offset: 0,
           }),
           summary: expect.objectContaining({
+            attempt: expect.objectContaining({
+              current: expect.any(Number),
+              total: expect.any(Number),
+              label: expect.any(String),
+            }),
             completedSteps: expect.any(Number),
             changedFiles: expect.any(Array),
+            planPreview: expect.objectContaining({
+              steps: expect.any(Array),
+            }),
           }),
         }),
       );
@@ -153,8 +161,14 @@ describe('API server', () => {
             offset: 0,
           }),
           summary: expect.objectContaining({
+            attempt: expect.objectContaining({
+              label: expect.any(String),
+            }),
             completedSteps: expect.any(Number),
             changedFiles: expect.any(Array),
+            planPreview: expect.objectContaining({
+              steps: expect.any(Array),
+            }),
           }),
         }),
       );
@@ -241,6 +255,20 @@ describe('API server', () => {
             updatedAt: expect.any(String),
           }),
           actions: expect.any(Array),
+        }),
+      );
+      expect(taskViewJson.runs[0]).toEqual(
+        expect.objectContaining({
+          summary: expect.objectContaining({
+            attempt: expect.objectContaining({
+              current: expect.any(Number),
+              total: expect.any(Number),
+              label: expect.any(String),
+            }),
+            planPreview: expect.objectContaining({
+              steps: expect.any(Array),
+            }),
+          }),
         }),
       );
 

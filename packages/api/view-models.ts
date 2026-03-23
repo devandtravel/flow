@@ -33,9 +33,33 @@ const cursorPageSchema = z.object({
 });
 
 const taskActionViewModelSchema = z.object({
-  action: z.enum(['retry', 'replan', 'escalate', 'cancel']),
+  action: z.enum(['retry', 'replan', 'retry_with_constraints', 'replan_from_feedback', 'escalate', 'cancel']),
   label: z.string().min(1),
   tone: z.enum(['default', 'warning', 'danger']),
+});
+
+const attemptViewModelSchema = z.object({
+  current: z.number().int().positive(),
+  total: z.number().int().positive(),
+  label: z.string().min(1),
+});
+
+const planPreviewStepViewModelSchema = z.object({
+  tool: z.string().min(1),
+  rationale: z.string().min(1),
+});
+
+const planPreviewViewModelSchema = z.object({
+  assumptions: z.array(z.string()),
+  risks: z.array(z.string()),
+  confidence: z.number().min(0).max(1),
+  steps: z.array(planPreviewStepViewModelSchema),
+});
+
+const criticFeedbackViewModelSchema = z.object({
+  feedback: z.array(z.string()),
+  failureClasses: z.array(z.string()),
+  doNotRepeatRules: z.array(z.string()),
 });
 
 const diffFileSchema = z.object({
@@ -120,12 +144,15 @@ export type ArtifactPreviewViewModel = z.infer<typeof artifactPreviewViewModelSc
 export const runSummaryViewModelSchema = z.object({
   run: runRecordSchema,
   summary: z.object({
+    attempt: attemptViewModelSchema,
     completedSteps: z.number().int().nonnegative(),
     failedSteps: z.number().int().nonnegative(),
     changedFiles: z.array(z.string()),
     score: z.number().min(0).max(1).nullable(),
     latestEventTitle: z.string().nullable(),
     latestEventLevel: eventLevelSchema.nullable(),
+    planPreview: planPreviewViewModelSchema.nullable(),
+    criticFeedback: criticFeedbackViewModelSchema.nullable(),
   }),
 });
 export type RunSummaryViewModel = z.infer<typeof runSummaryViewModelSchema>;
@@ -193,6 +220,66 @@ function toStringArray(value: unknown): string[] {
     return [];
   }
   return value.filter((item): item is string => typeof item === 'string');
+}
+
+function createAttemptViewModel(iteration: number, maxIterations: number) {
+  return attemptViewModelSchema.parse({
+    current: iteration,
+    total: maxIterations,
+    label: `Попытка ${String(iteration)}/${String(maxIterations)}`,
+  });
+}
+
+function parseEventPayloadRecord(event: RunEventRecord): Record<string, unknown> | null {
+  return toJsonRecord(safeParseJson(event.payload_json));
+}
+
+function extractPlanPreview(events: RunEventRecord[]) {
+  const planningPayloadSchema = z.object({
+    preview: planPreviewViewModelSchema,
+  });
+
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || event.message !== 'planning_completed') {
+      continue;
+    }
+
+    const payload = parseEventPayloadRecord(event);
+    const parsed = planningPayloadSchema.safeParse(payload);
+    if (parsed.success) {
+      return parsed.data.preview;
+    }
+  }
+
+  return null;
+}
+
+function extractCriticFeedback(events: RunEventRecord[]) {
+  const criticPayloadSchema = z.object({
+    feedback: z.array(z.string()),
+    failureClasses: z.array(z.string()).default([]),
+    doNotRepeatRules: z.array(z.string()).default([]),
+  });
+
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || event.message !== 'plan_invalid') {
+      continue;
+    }
+
+    const payload = parseEventPayloadRecord(event);
+    const parsed = criticPayloadSchema.safeParse(payload);
+    if (parsed.success) {
+      return criticFeedbackViewModelSchema.parse({
+        feedback: parsed.data.feedback,
+        failureClasses: parsed.data.failureClasses,
+        doNotRepeatRules: parsed.data.doNotRepeatRules,
+      });
+    }
+  }
+
+  return null;
 }
 
 function parseHunkHeader(header: string): {
@@ -546,7 +633,13 @@ function resolveLatestEvent(events: RunEventRecord[]): { title: string | null; l
   };
 }
 
-function buildRunSummary(run: RunRecord, steps: StepRecord[], events: RunEventRecord[], evaluations: EvaluationRecord[]): RunSummaryViewModel {
+function buildRunSummary(
+  run: RunRecord,
+  steps: StepRecord[],
+  events: RunEventRecord[],
+  evaluations: EvaluationRecord[],
+  maxIterations: number,
+): RunSummaryViewModel {
   const completedSteps = steps.filter((step) => step.status === 'completed').length;
   const failedSteps = steps.filter((step) => step.status === 'failed').length;
   const latestEvent = resolveLatestEvent(events);
@@ -555,25 +648,32 @@ function buildRunSummary(run: RunRecord, steps: StepRecord[], events: RunEventRe
   return runSummaryViewModelSchema.parse({
     run,
     summary: {
+      attempt: createAttemptViewModel(run.iteration, maxIterations),
       completedSteps,
       failedSteps,
       changedFiles: extractChangedFiles(steps),
       score: latestEvaluation ? latestEvaluation.score : null,
       latestEventTitle: latestEvent.title,
       latestEventLevel: latestEvent.level,
+      planPreview: extractPlanPreview(events),
+      criticFeedback: extractCriticFeedback(events),
     },
   });
 }
 
-function buildTaskActionViewModels(actions: Array<'retry' | 'replan' | 'escalate' | 'cancel'>): Array<z.infer<typeof taskActionViewModelSchema>> {
+function buildTaskActionViewModels(actions: Array<'retry' | 'replan' | 'retry_with_constraints' | 'replan_from_feedback' | 'escalate' | 'cancel'>): Array<z.infer<typeof taskActionViewModelSchema>> {
   return actions.map((action) =>
     taskActionViewModelSchema.parse({
       action,
       label:
         action === 'retry'
           ? 'Повторить'
+          : action === 'retry_with_constraints'
+            ? 'Повторить с учётом ограничений'
           : action === 'replan'
             ? 'Построить новый план'
+            : action === 'replan_from_feedback'
+              ? 'Построить план по замечаниям'
             : action === 'escalate'
               ? 'Эскалировать'
               : 'Отменить',
@@ -601,10 +701,11 @@ export function buildTaskViewModel(input: {
     limit: number;
     offset: number;
   };
-  actions: Array<'retry' | 'replan' | 'escalate' | 'cancel'>;
+  maxIterations: number;
+  actions: Array<'retry' | 'replan' | 'retry_with_constraints' | 'replan_from_feedback' | 'escalate' | 'cancel'>;
 }): TaskViewModel {
   const runSummaries = input.runs.map((entry) =>
-    buildRunSummary(entry.run, entry.steps, entry.events, entry.evaluations),
+    buildRunSummary(entry.run, entry.steps, entry.events, entry.evaluations, input.maxIterations),
   );
   const latestRun = runSummaries[0] ?? null;
 
@@ -630,15 +731,17 @@ export function buildRunViewModel(
   run: RunRecord,
   steps: StepRecord[],
   events: RunEventRecord[],
+  summaryEvents: RunEventRecord[],
   evaluations: EvaluationRecord[],
   page: {
     total: number;
     limit: number;
     offset: number;
   },
-  actions: Array<'retry' | 'replan' | 'escalate' | 'cancel'>,
+  maxIterations: number,
+  actions: Array<'retry' | 'replan' | 'retry_with_constraints' | 'replan_from_feedback' | 'escalate' | 'cancel'>,
 ): RunViewModel {
-  const summary = buildRunSummary(run, steps, events, evaluations);
+  const summary = buildRunSummary(run, steps, summaryEvents, evaluations, maxIterations);
   return runViewModelSchema.parse({
     task,
     run,
