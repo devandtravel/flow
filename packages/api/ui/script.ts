@@ -449,6 +449,10 @@ function renderTaskActions(actions, taskId) {
   ].join('');
 }
 
+function isTaskDeletable(task) {
+  return task && ['completed', 'failed', 'blocked', 'cancelled', 'rolled_back', 'escalated'].includes(task.state);
+}
+
 function normalizeChangedFiles(value) {
   if (!Array.isArray(value)) {
     return [];
@@ -785,10 +789,14 @@ function renderTasks(tasks) {
   return filteredTasks
     .map((task) => {
       const selected = task.id === state.selectedTaskId ? ' selected' : '';
+      const deleteButton = isTaskDeletable(task)
+        ? '<button type="button" class="button danger task-delete-button" data-task-delete-id="' + escapeHtml(task.id) + '">' + escapeHtml(copy.deleteTask) + '</button>'
+        : '';
       return [
-        '<button type="button" class="card task-card' + selected + '" data-task-id="' + escapeHtml(task.id) + '">',
+        '<article class="card task-card' + selected + '">',
+        '<button type="button" class="task-card-main" data-task-id="' + escapeHtml(task.id) + '">',
         '<div class="card-title">',
-        '<div class="stack gap-xs">',
+        '<div class="stack gap-xs task-card-copy">',
         '<strong>' + escapeHtml(task.goal) + '</strong>',
         '<div class="meta mono">' + escapeHtml(task.id) + '</div>',
         '</div>',
@@ -797,6 +805,8 @@ function renderTasks(tasks) {
         '<div class="meta">target: ' + escapeHtml(task.target_id) + '</div>',
         '<div class="meta">' + escapeHtml(formatRelativeTime(task.updated_at)) + '</div>',
         '</button>',
+        deleteButton ? '<div class="task-card-actions">' + deleteButton + '</div>' : '',
+        '</article>',
       ].join('');
     })
     .join('');
@@ -1097,6 +1107,21 @@ function bindShellEvents() {
       return;
     }
 
+    const deleteAllTasksNode = event.target.closest('[data-delete-all-tasks]');
+    if (deleteAllTasksNode instanceof HTMLElement) {
+      void deleteAllTasks();
+      return;
+    }
+
+    const deleteTaskNode = event.target.closest('[data-task-delete-id]');
+    if (deleteTaskNode instanceof HTMLElement) {
+      const taskId = deleteTaskNode.getAttribute('data-task-delete-id');
+      if (taskId) {
+        void deleteTask(taskId);
+      }
+      return;
+    }
+
     const taskNode = event.target.closest('[data-task-id]');
     if (taskNode instanceof HTMLElement) {
       const taskId = taskNode.getAttribute('data-task-id');
@@ -1310,6 +1335,66 @@ async function runTaskAction(taskId, action) {
     });
   } catch (error) {
     state.lastError = error instanceof Error ? error.message : 'Не удалось выполнить действие над задачей.';
+  } finally {
+    updateNotification();
+    await refreshDashboard({ showLoading: false, force: true });
+  }
+}
+
+async function deleteTask(taskId) {
+  if (!window.confirm(copy.deleteTaskConfirm)) {
+    return;
+  }
+
+  state.lastError = '';
+  updateNotification();
+  try {
+    await fetchJson('/tasks/' + encodeURIComponent(taskId), {
+      method: 'DELETE',
+    });
+    if (state.selectedTaskId === taskId) {
+      state.selectedTaskId = '';
+      state.selectedRunId = '';
+      state.selectedArtifactId = '';
+      state.taskRunCursor = '';
+      state.runEventCursor = '';
+      state.artifactCursor = '';
+      if (state.activeView !== 'overview' && state.activeView !== 'logs') {
+        state.activeView = 'overview';
+      }
+      persistUiState('replace');
+    }
+  } catch (error) {
+    state.lastError = error instanceof Error ? error.message : 'Не удалось удалить задачу.';
+  } finally {
+    updateNotification();
+    await refreshDashboard({ showLoading: false, force: true });
+  }
+}
+
+async function deleteAllTasks() {
+  if (!window.confirm(copy.deleteAllTasksConfirm)) {
+    return;
+  }
+
+  state.lastError = '';
+  updateNotification();
+  try {
+    await fetchJson('/tasks', {
+      method: 'DELETE',
+    });
+    state.selectedTaskId = '';
+    state.selectedRunId = '';
+    state.selectedArtifactId = '';
+    state.taskRunCursor = '';
+    state.runEventCursor = '';
+    state.artifactCursor = '';
+    if (state.activeView !== 'overview' && state.activeView !== 'logs') {
+      state.activeView = 'overview';
+    }
+    persistUiState('replace');
+  } catch (error) {
+    state.lastError = error instanceof Error ? error.message : 'Не удалось удалить задачи.';
   } finally {
     updateNotification();
     await refreshDashboard({ showLoading: false, force: true });
@@ -1595,7 +1680,7 @@ function updateViewContent(loadedData) {
       ? renderLogs(loadedData.logs)
       : state.activeView === 'run'
         ? renderRunPage(loadedData.runView)
-        : renderOverview(loadedData.taskView, dashboard.maintenance.summary, dashboard.metrics);
+        : renderOverview(loadedData.taskView, dashboard.maintenance.summary, dashboard.metrics, tasks);
 
   setHtml('viewContent', content);
 

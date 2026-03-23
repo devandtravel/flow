@@ -1,9 +1,38 @@
-import { existsSync, mkdtempSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildDefaultConfig } from '../packages/config';
 import { AgentRuntime } from '../packages/core/loop/runtime';
+import { MockLlmProvider, type LlmProvider, type LlmRequest } from '../packages/llm';
+
+class SequencedProvider implements LlmProvider {
+  private readonly responses: readonly unknown[];
+  private index = 0;
+
+  constructor(responses: readonly unknown[]) {
+    this.responses = responses;
+  }
+
+  async complete<TOutput>(request: LlmRequest<TOutput>): Promise<TOutput> {
+    const response = this.responses[this.index];
+    this.index += 1;
+    return request.schema.parse(response);
+  }
+}
+
+class DelayedMockProvider implements LlmProvider {
+  constructor(private readonly delayMs: number) {}
+
+  async complete<TOutput>(request: LlmRequest<TOutput>): Promise<TOutput> {
+    await new Promise((resolve) => {
+      setTimeout(resolve, this.delayMs);
+    });
+
+    const mockProvider = new MockLlmProvider();
+    return mockProvider.complete(request);
+  }
+}
 
 describe('AgentRuntime', () => {
   it('executes a project task with the mock provider and stores typed artifacts', async () => {
@@ -25,6 +54,153 @@ describe('AgentRuntime', () => {
     expect(eventMessages).toEqual(
       expect.arrayContaining(['run_started', 'planning_started', 'planning_completed', 'step_started', 'step_completed', 'run_completed']),
     );
+  });
+
+  it('deletes a completed task together with its runtime data and artifact directory', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-delete-task-'));
+    const config = buildDefaultConfig(workspaceRoot, 'project');
+    config.llm.provider = 'mock';
+    config.autonomy.mode = 'autonomous';
+    const runtime = new AgentRuntime({ workspaceRoot, config });
+    const task = runtime.createTask('write project output');
+
+    const summary = await runtime.runTask(task.id);
+    const artifactRunDir = path.join(workspaceRoot, '.agent', 'artifacts', summary.runId);
+    expect(existsSync(artifactRunDir)).toBe(true);
+
+    const deletion = runtime.deleteTask(task.id);
+
+    expect(deletion.taskId).toBe(task.id);
+    expect(deletion.deletedCounts.tasks).toBe(1);
+    expect(runtime.listTasks()).toHaveLength(0);
+    expect(existsSync(artifactRunDir)).toBe(false);
+  });
+
+  it('refuses to delete all tasks while at least one task is not in a deletable state', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-delete-all-guard-'));
+    const config = buildDefaultConfig(workspaceRoot, 'project');
+    config.llm.provider = 'mock';
+    const runtime = new AgentRuntime({ workspaceRoot, config });
+    runtime.createTask('queued task');
+
+    expect(() => runtime.deleteAllTasks()).toThrow(/Delete-all is allowed only when all tasks are in deletable states/);
+  });
+
+  it('salvages a read-only observation prefix and completes after replanning with exact snapshots', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-salvage-'));
+    writeFileSync(path.join(workspaceRoot, 'README.md'), '# Initial\n', 'utf8');
+
+    const config = buildDefaultConfig(workspaceRoot, 'project');
+    config.autonomy.mode = 'autonomous';
+
+    const provider = new SequencedProvider([
+      {
+        goal: 'rewrite readme',
+        assumptions: [],
+        risks: [],
+        steps: [
+          {
+            tool: 'fs.read_file',
+            input_json: '{"path":"README.md"}',
+            expected_json: '{"content_includes":"# Initial"}',
+            rationale: 'Read the current file before editing it.',
+          },
+          {
+            tool: 'repo.apply_patch',
+            input_json: '{"patch":"*** Update File: README.md\\n@@\\n <точный контекст будет основан на шаге 1>\\n+# Changed\\n"}',
+            expected_json: '{"changed":true}',
+            rationale: 'Apply a speculative patch.',
+          },
+        ],
+        done: false,
+        confidence: 0.4,
+      },
+      {
+        decision: 'replan',
+        reason: 'Use observed file content to produce a full rewrite.',
+      },
+      {
+        goal: 'rewrite readme',
+        assumptions: [],
+        risks: [],
+        steps: [
+          {
+            tool: 'fs.write_file',
+            input_json: '{"path":"README.md","content":"# Initial\\n\\n## FLOW validation\\n\\nValidated through observation-first planning.\\n"}',
+            expected_json: '{"changed":true}',
+            rationale: 'Rewrite the file using the exact observed content plus the validated section.',
+          },
+          {
+            tool: 'fs.read_file',
+            input_json: '{"path":"README.md"}',
+            expected_json: '{"content_includes":"FLOW validation"}',
+            rationale: 'Read the rewritten file and confirm the inserted section exists.',
+          },
+        ],
+        done: false,
+        confidence: 0.8,
+      },
+      {
+        valid: true,
+        feedback: [],
+        plan: {
+          goal: 'rewrite readme',
+          assumptions: [],
+          risks: [],
+          steps: [
+            {
+              tool: 'fs.write_file',
+              input_json: '{"path":"README.md","content":"# Initial\\n\\n## FLOW validation\\n\\nValidated through observation-first planning.\\n"}',
+              expected_json: '{"changed":true}',
+              rationale: 'Rewrite the file using the exact observed content plus the validated section.',
+            },
+            {
+              tool: 'fs.read_file',
+              input_json: '{"path":"README.md"}',
+              expected_json: '{"content_includes":"FLOW validation"}',
+              rationale: 'Read the rewritten file and confirm the inserted section exists.',
+            },
+          ],
+          done: false,
+          confidence: 0.8,
+        },
+      },
+      {
+        score: 1,
+        issues: [],
+        suggestions: [],
+      },
+    ]);
+
+    const runtime = new AgentRuntime({ workspaceRoot, config, provider });
+    const task = runtime.createTask('rewrite readme');
+    const summary = await runtime.runTask(task.id);
+    const timeline = runtime.getTaskTimeline(task.id);
+
+    expect(summary.state).toBe('completed');
+    expect(timeline.runs.some((run) => run.events.some((event) => event.message === 'observation_salvage_completed'))).toBe(true);
+    expect(timeline.runs.some((run) => run.events.some((event) => event.message === 'plan_invalid'))).toBe(true);
+    expect(readFileSync(path.join(workspaceRoot, 'README.md'), 'utf8')).toContain('FLOW validation');
+  });
+
+  it('does not spend execution runtime budget on planning time', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-planning-budget-'));
+    const config = buildDefaultConfig(workspaceRoot, 'project');
+    config.autonomy.mode = 'autonomous';
+    config.llm.provider = 'mock';
+    config.limits.max_runtime_sec = 1;
+
+    const runtime = new AgentRuntime({
+      workspaceRoot,
+      config,
+      provider: new DelayedMockProvider(1200),
+    });
+    const task = runtime.createTask('write project output');
+
+    const summary = await runtime.runTask(task.id);
+
+    expect(summary.state).toBe('completed');
+    expect(existsSync(path.join(workspaceRoot, 'agent-output.txt'))).toBe(true);
   });
 
   it('moves a sensitive step into the approval queue and resumes after approval', async () => {
@@ -342,5 +518,45 @@ describe('AgentRuntime', () => {
     expect(runEvents.page.limit).toBe(1);
     expect(runEvents.events.length).toBeGreaterThanOrEqual(1);
     expect(runEvents.events.every((event) => event.level === 'info')).toBe(true);
+  });
+
+  it('writes a planning transport diagnostic artifact when codex planning fails', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-planning-diagnostic-'));
+    const executablePath = path.join(workspaceRoot, 'mock-codex.js');
+    writeFileSync(
+      executablePath,
+      [
+        '#!/usr/bin/env node',
+        "const fs = require('node:fs');",
+        "const outputIndex = process.argv.indexOf('--output-last-message');",
+        'if (outputIndex >= 0) {',
+        "  fs.writeFileSync(process.argv[outputIndex + 1], '');",
+        '}',
+        "process.stdout.write('{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"error\",\"message\":\"ignored\"}}\\n');",
+      ].join('\n'),
+      'utf8',
+    );
+    chmodSync(executablePath, 0o755);
+
+    const config = buildDefaultConfig(workspaceRoot, 'project');
+    config.llm.provider = 'codex';
+    config.llm.executable = executablePath;
+    config.llm.retry_count = 0;
+    config.limits.max_iterations = 1;
+    const runtime = new AgentRuntime({ workspaceRoot, config });
+    const task = runtime.createTask('planner diagnostic');
+
+    const summary = await runtime.runTask(task.id);
+    const timeline = runtime.getTaskTimeline(task.id);
+    const failureEvent = timeline.runs[0]?.events.find((event) => event.message === 'plan_generation_failed');
+    const failurePayload = failureEvent ? JSON.parse(failureEvent.payload_json) : null;
+    const diagnosticPath =
+      failurePayload && typeof failurePayload === 'object' && !Array.isArray(failurePayload)
+        ? failurePayload['diagnosticPath']
+        : null;
+
+    expect(summary.state).toBe('escalated');
+    expect(typeof diagnosticPath).toBe('string');
+    expect(existsSync(typeof diagnosticPath === 'string' ? diagnosticPath : '')).toBe(true);
   });
 });

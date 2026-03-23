@@ -269,3 +269,15 @@ export const memorySummarySchema = z.object({
   semantic: z.array(z.record(z.string(), z.unknown())),
 });
 export type MemorySummary = z.infer<typeof memorySummarySchema>;
+
+export const fileSnapshotMemorySchema = z.object({
+  type: z.literal('file_snapshot'),
+  task_id: z.string().uuid(),
+  target_id: z.string().min(1),
+  path: z.string().min(1),
+  content: z.string(),
+  run_id: z.string().uuid(),
+  step_id: z.string().uuid(),
+  recorded_at: z.string().datetime(),
+});
+export type FileSnapshotMemory = z.infer<typeof fileSnapshotMemorySchema>;

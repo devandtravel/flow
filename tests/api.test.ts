@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -331,6 +331,84 @@ describe('API server', () => {
         state: 'queued',
       }),
     );
+  });
+
+  it('deletes a completed task through the REST API and removes its artifacts', async () => {
+    const createResponse = await fetch(`${currentBaseUrl}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ goal: 'write api output for deletion', autorun: true }),
+    });
+    expect(createResponse.status).toBe(201);
+    const summaryJson = await createResponse.json();
+
+    if (!summaryJson || typeof summaryJson !== 'object') {
+      throw new Error('Expected a summary payload.');
+    }
+
+    if (!('task' in summaryJson) || !summaryJson.task || typeof summaryJson.task !== 'object' || !('id' in summaryJson.task) || typeof summaryJson.task.id !== 'string') {
+      throw new Error('Summary payload is missing task.id.');
+    }
+
+    if (!('runId' in summaryJson) || typeof summaryJson.runId !== 'string') {
+      throw new Error('Summary payload is missing runId.');
+    }
+
+    const artifactRunDir = path.join(workspaceRoot, '.agent', 'artifacts', summaryJson.runId);
+    expect(existsSync(artifactRunDir)).toBe(true);
+
+    const deleteResponse = await fetch(`${currentBaseUrl}/tasks/${summaryJson.task.id}`, {
+      method: 'DELETE',
+    });
+    expect(deleteResponse.status).toBe(200);
+    const deleteJson = await deleteResponse.json();
+    expect(deleteJson).toEqual(
+      expect.objectContaining({
+        taskId: summaryJson.task.id,
+        deletedCounts: expect.objectContaining({
+          tasks: 1,
+        }),
+      }),
+    );
+
+    const tasksResponse = await fetch(`${currentBaseUrl}/tasks`);
+    const tasksJson = await tasksResponse.json();
+    expect(tasksJson).toEqual([]);
+    expect(existsSync(artifactRunDir)).toBe(false);
+  });
+
+  it('deletes all tasks through the REST API when all tasks are deletable', async () => {
+    const firstResponse = await fetch(`${currentBaseUrl}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ goal: 'first task for bulk deletion', autorun: true }),
+    });
+    expect(firstResponse.status).toBe(201);
+
+    const secondResponse = await fetch(`${currentBaseUrl}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ goal: 'second task for bulk deletion', autorun: true }),
+    });
+    expect(secondResponse.status).toBe(201);
+
+    const deleteAllResponse = await fetch(`${currentBaseUrl}/tasks`, {
+      method: 'DELETE',
+    });
+    expect(deleteAllResponse.status).toBe(200);
+    const deleteAllJson = await deleteAllResponse.json();
+    expect(deleteAllJson).toEqual(
+      expect.objectContaining({
+        deletedTaskIds: expect.any(Array),
+        deletedCounts: expect.objectContaining({
+          tasks: 2,
+        }),
+      }),
+    );
+
+    const tasksResponse = await fetch(`${currentBaseUrl}/tasks`);
+    const tasksJson = await tasksResponse.json();
+    expect(tasksJson).toEqual([]);
   });
 
   it('manages targets, schedules, and maintenance endpoints', async () => {

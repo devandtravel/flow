@@ -18,7 +18,7 @@ import {
   type TaskPlan,
   type TaskRecord,
 } from '../../domain';
-import { RuntimeDatabase } from '../../db/database';
+import { RuntimeDatabase, type TaskDeletionSummary as DatabaseTaskDeletionSummary } from '../../db/database';
 import { ConflictError, InvalidOperationError, NotFoundError, ValidationError } from '../../errors';
 import { createLlmProvider } from '../../llm';
 import { MemoryService } from '../../memory';
@@ -33,6 +33,7 @@ import {
   type ToolExecutionContext,
   type ToolResult,
 } from '../../tools';
+import { buildObservationSalvagePlan } from '../agents/observation-salvage';
 import { buildReplanGuidance } from '../agents/replan-guidance';
 import { CriticAgent, EvaluatorAgent, ExecutorAgent, PlannerAgent, SupervisorAgent, VerifierAgent } from '../agents';
 import { assertValidRunTransition, assertValidStepTransition, assertValidTaskTransition } from '../state';
@@ -44,6 +45,7 @@ const approvalInputSchema = z.object({
 export interface RuntimeOptions {
   workspaceRoot: string;
   config?: RuntimeConfig;
+  provider?: ReturnType<typeof createLlmProvider>;
 }
 
 export interface RunSummary {
@@ -78,6 +80,34 @@ export interface CleanupResult {
   deletedRunEventIds: string[];
   deletedMemoryEntryIds: string[];
   deletedArtifactPaths: string[];
+}
+
+export interface DeletedTaskSummary {
+  taskId: string;
+  deletedCounts: {
+    approvals: number;
+    artifacts: number;
+    evaluations: number;
+    memoryEntries: number;
+    runEvents: number;
+    runs: number;
+    steps: number;
+    tasks: number;
+  };
+}
+
+export interface DeletedTasksSummary {
+  deletedTaskIds: string[];
+  deletedCounts: {
+    approvals: number;
+    artifacts: number;
+    evaluations: number;
+    memoryEntries: number;
+    runEvents: number;
+    runs: number;
+    steps: number;
+    tasks: number;
+  };
 }
 
 export interface PageOptions {
@@ -145,6 +175,11 @@ export type RuntimeUpdateEvent =
       timestamp: string;
       taskId: string;
       state: TaskRecord['state'];
+    }
+  | {
+      kind: 'task_deleted';
+      timestamp: string;
+      taskId: string;
     }
   | {
       kind: 'run_changed';
@@ -258,6 +293,21 @@ function getStringValue(payloadJson: string, key: string): string | undefined {
   return envelope[key];
 }
 
+function getStringDetail(details: Record<string, unknown>, key: string): string | undefined {
+  const value = details[key];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function getNumberDetail(details: Record<string, unknown>, key: string): number | undefined {
+  const value = details[key];
+  return typeof value === 'number' ? value : undefined;
+}
+
+function getBooleanDetail(details: Record<string, unknown>, key: string): boolean | undefined {
+  const value = details[key];
+  return typeof value === 'boolean' ? value : undefined;
+}
+
 function normalizeRootPath(rootPath: string): string {
   return path.resolve(rootPath);
 }
@@ -266,6 +316,10 @@ function pathsConflict(left: string, right: string): boolean {
   const normalizedLeft = normalizeRootPath(left);
   const normalizedRight = normalizeRootPath(right);
   return normalizedLeft === normalizedRight || normalizedLeft.startsWith(`${normalizedRight}${path.sep}`) || normalizedRight.startsWith(`${normalizedLeft}${path.sep}`);
+}
+
+function isTaskDeletionAllowedState(state: TaskRecord['state']): boolean {
+  return ['completed', 'failed', 'blocked', 'cancelled', 'rolled_back', 'escalated'].includes(state);
 }
 
 export class AgentRuntime {
@@ -303,7 +357,7 @@ export class AgentRuntime {
     this.memory = new MemoryService(this.database);
     this.logger = createLogger(directories.logsDir);
 
-    const provider = createLlmProvider(this.config.llm);
+    const provider = options.provider ?? createLlmProvider(this.config.llm);
     this.planner = new PlannerAgent(provider);
     this.critic = new CriticAgent(provider);
     this.supervisor = new SupervisorAgent(provider);
@@ -526,6 +580,27 @@ export class AgentRuntime {
       .some((event) => event.message === 'plan_invalid' || event.message === 'plan_generation_failed');
   }
 
+  private ensureTaskDeletionAllowed(task: TaskRecord): void {
+    if (isTaskDeletionAllowedState(task.state)) {
+      return;
+    }
+
+    throw new InvalidOperationError(
+      `Task ${task.id} cannot be deleted while it is in state ${task.state}. Cancel or finish the task first.`,
+      {
+        taskId: task.id,
+        state: task.state,
+      },
+    );
+  }
+
+  private removeDeletedTaskArtifacts(taskDeletion: DatabaseTaskDeletionSummary): void {
+    for (const runId of taskDeletion.runIds) {
+      rmSync(path.join(this.artifactsDir, runId), { recursive: true, force: true });
+      this.changedFilesByRun.delete(runId);
+    }
+  }
+
   private recordTaskOperatorAction(
     taskId: string,
     action: TaskOperatorAction,
@@ -607,9 +682,166 @@ export class AgentRuntime {
     ];
   }
 
+  private createRunDiagnosticArtifact(
+    runId: string,
+    name: string,
+    payload: Record<string, unknown>,
+  ): string {
+    const diagnosticDir = path.join(this.artifactsDir, runId, '_diagnostics');
+    mkdirSync(diagnosticDir, { recursive: true });
+    const diagnosticPath = path.join(diagnosticDir, `${name}.json`);
+    writeFileSync(diagnosticPath, JSON.stringify(payload, null, 2));
+    return diagnosticPath;
+  }
+
+  private createTransportDiagnosticPayload(
+    error: unknown,
+    contract: string,
+  ): { eventPayload: Record<string, unknown> } {
+    if (!(error instanceof InvalidOperationError)) {
+      return {
+        eventPayload: {
+          contract,
+        },
+      };
+    }
+
+    const details = error.details;
+    return {
+      eventPayload: {
+        contract,
+        executable: getStringDetail(details, 'executable'),
+        model: getStringDetail(details, 'model'),
+        outputPath: getStringDetail(details, 'outputPath'),
+        responseExists: getBooleanDetail(details, 'responseExists'),
+        attempt: getNumberDetail(details, 'attempt'),
+        maxAttempts: getNumberDetail(details, 'maxAttempts'),
+      },
+    };
+  }
+
+  private recordVerifiedStepMemory(
+    task: TaskRecord,
+    run: RunRecord,
+    stepRecord: StepRecord,
+    step: TaskPlan['steps'][number],
+    result: z.infer<typeof toolResultSchema>,
+  ): void {
+    if (!result.success) {
+      return;
+    }
+
+    if (step.tool === 'fs.read_file') {
+      const filePath = step.input['path'];
+      const fileContent = result.output['content'];
+      if (typeof filePath === 'string' && typeof fileContent === 'string') {
+        this.memory.recordSemantic(`file:${task.id}:${filePath}`, {
+          type: 'file_snapshot',
+          task_id: task.id,
+          target_id: task.target_id,
+          path: filePath,
+          content: fileContent,
+          run_id: run.id,
+          step_id: stepRecord.id,
+          recorded_at: new Date().toISOString(),
+        });
+      }
+    }
+
+    this.memory.recordSuccessfulPattern(step.tool, {
+      input: step.input,
+      target_id: task.target_id,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private async executeObservationSalvage(
+    task: TaskRecord,
+    run: RunRecord,
+    target: TargetConfig,
+    steps: readonly TaskPlan['steps'][number][],
+    createdArtifacts: ArtifactRecord[],
+  ): Promise<{ executedSteps: number; snapshotPaths: string[] }> {
+    if (steps.length === 0) {
+      return {
+        executedSteps: 0,
+        snapshotPaths: [],
+      };
+    }
+
+    this.transitionRun(this.database.getRun(run.id) ?? run, 'executing');
+    this.createRunEvent(task.id, run.id, 'info', 'observation_salvage_started', {
+      stepCount: steps.length,
+    });
+
+    const executionContext: ToolExecutionContext = {
+      workspaceRoot: target.root,
+      policy: this.policy,
+      httpAllowlist: this.config.workspace.http_allowlist,
+    };
+    const snapshotPaths = new Set<string>();
+    let executedSteps = 0;
+
+    for (const [index, step] of steps.entries()) {
+      const stepRecord = this.database.createStep(run.id, index, step.tool, step.input, step.expected);
+      this.transitionStep(stepRecord, 'started');
+      this.createRunEvent(task.id, run.id, 'info', 'step_started', {
+        step: step.tool,
+        stepIndex: index,
+        source: 'observation_salvage',
+      });
+
+      const result = toolResultSchema.parse(
+        await this.executor.run(step, (toolName, input) => executeTool(this.tools, toolName, input, executionContext)),
+      );
+      const verification = this.verifier.check(step, result);
+      const completedStep = this.database.completeStep(
+        stepRecord.id,
+        {
+          result,
+          verification,
+        },
+        verification.verified ? 'completed' : 'failed',
+      );
+
+      createdArtifacts.push(...this.createArtifacts(completedStep, { step, source: 'observation_salvage' }, result, verification));
+      this.createRunEvent(task.id, run.id, verification.verified ? 'info' : 'error', 'step_completed', {
+        step: step.tool,
+        verified: verification.verified,
+        evidence: verification.evidence,
+        changedFiles: result.changedFiles,
+        source: 'observation_salvage',
+      });
+
+      if (!verification.verified) {
+        break;
+      }
+
+      executedSteps += 1;
+      this.recordVerifiedStepMemory(task, run, completedStep, step, result);
+      if (step.tool === 'fs.read_file') {
+        const filePath = step.input['path'];
+        if (typeof filePath === 'string') {
+          snapshotPaths.add(filePath);
+        }
+      }
+    }
+
+    this.createRunEvent(task.id, run.id, 'info', 'observation_salvage_completed', {
+      executedSteps,
+      snapshotPaths: [...snapshotPaths],
+    });
+
+    return {
+      executedSteps,
+      snapshotPaths: [...snapshotPaths],
+    };
+  }
+
   private async planTask(task: TaskRecord, target: TargetConfig): Promise<TaskPlan> {
     const toolCatalog = listToolDefinitions(this.tools).filter((tool) => target.capabilities.includes(tool.capability));
     const memory = this.memory.getContext();
+    const exactFileSnapshots = this.memory.getTaskFileSnapshots(task.id);
     const recentFailureHints = this.getRecentTaskFailureHints(task.id);
     const replanGuidance = buildReplanGuidance(recentFailureHints);
     return this.planner.generate({
@@ -622,10 +854,12 @@ export class AgentRuntime {
           root: target.root,
         },
         autonomy: this.config.autonomy.mode,
+        exactFileSnapshotPaths: exactFileSnapshots.map((snapshot) => snapshot.path),
         recentFailureHints,
         recentFailureClasses: replanGuidance.failureClasses,
         doNotRepeatRules: replanGuidance.doNotRepeatRules,
       }),
+      exactFileSnapshots,
     });
   }
 
@@ -738,6 +972,76 @@ export class AgentRuntime {
 
   listTasks(): TaskRecord[] {
     return this.database.listTasks();
+  }
+
+  deleteTask(taskId: string): DeletedTaskSummary {
+    const task = this.requireTask(taskId);
+    this.ensureTaskDeletionAllowed(task);
+    const deletion = this.database.deleteTaskCascade(taskId);
+    this.removeDeletedTaskArtifacts(deletion);
+    this.emitRuntimeUpdate({
+      kind: 'task_deleted',
+      taskId,
+    });
+    return {
+      taskId,
+      deletedCounts: {
+        approvals: deletion.deletedCounts.approvals,
+        artifacts: deletion.deletedCounts.artifacts,
+        evaluations: deletion.deletedCounts.evaluations,
+        memoryEntries: deletion.deletedCounts.memoryEntries,
+        runEvents: deletion.deletedCounts.runEvents,
+        runs: deletion.deletedCounts.runs,
+        steps: deletion.deletedCounts.steps,
+        tasks: deletion.deletedCounts.task,
+      },
+    };
+  }
+
+  deleteAllTasks(): DeletedTasksSummary {
+    const tasks = this.listTasks();
+    const blockedTasks = tasks.filter((task) => !isTaskDeletionAllowedState(task.state));
+    if (blockedTasks.length > 0) {
+      throw new InvalidOperationError('Delete-all is allowed only when all tasks are in deletable states.', {
+        blockedTaskIds: blockedTasks.map((task) => task.id),
+        blockedStates: blockedTasks.map((task) => task.state),
+      });
+    }
+
+    const deletedTaskIds: string[] = [];
+    const deletedCounts = {
+      approvals: 0,
+      artifacts: 0,
+      evaluations: 0,
+      memoryEntries: 0,
+      runEvents: 0,
+      runs: 0,
+      steps: 0,
+      tasks: 0,
+    };
+
+    for (const task of tasks) {
+      const deletion = this.database.deleteTaskCascade(task.id);
+      this.removeDeletedTaskArtifacts(deletion);
+      deletedTaskIds.push(task.id);
+      deletedCounts.approvals += deletion.deletedCounts.approvals;
+      deletedCounts.artifacts += deletion.deletedCounts.artifacts;
+      deletedCounts.evaluations += deletion.deletedCounts.evaluations;
+      deletedCounts.memoryEntries += deletion.deletedCounts.memoryEntries;
+      deletedCounts.runEvents += deletion.deletedCounts.runEvents;
+      deletedCounts.runs += deletion.deletedCounts.runs;
+      deletedCounts.steps += deletion.deletedCounts.steps;
+      deletedCounts.tasks += deletion.deletedCounts.task;
+      this.emitRuntimeUpdate({
+        kind: 'task_deleted',
+        taskId: task.id,
+      });
+    }
+
+    return {
+      deletedTaskIds,
+      deletedCounts,
+    };
   }
 
   listApprovals(): ApprovalRequestRecord[] {
@@ -1252,7 +1556,6 @@ export class AgentRuntime {
 
     const target = this.resolveTarget(task.target_id);
     const executionContext = this.buildExecutionContext(target);
-    const startedAt = Date.now();
     let iteration = 0;
     let lastPlan = createFallbackPlan(task.goal);
     let lastRunId = '';
@@ -1266,6 +1569,7 @@ export class AgentRuntime {
       }
 
       const run = this.database.createRun(task.id, iteration, 'queued');
+      let executionStartedAt = Date.now();
       lastRunId = run.id;
       this.transitionRun(run, 'planning');
       this.createRunEvent(task.id, run.id, 'info', 'run_started', {
@@ -1280,12 +1584,15 @@ export class AgentRuntime {
       if (!planSource.approval) {
         try {
           lastPlan = await this.planTask(task, target);
+          const availableTools = listToolDefinitions(this.tools).filter((tool) => target.capabilities.includes(tool.capability));
           this.createRunEvent(task.id, run.id, 'info', 'planning_completed', {
             stepCount: lastPlan.steps.length,
             confidence: lastPlan.confidence,
             preview: createPlanPreviewPayload(lastPlan),
           });
-          const review = await this.critic.validate(lastPlan, listToolDefinitions(this.tools).filter((tool) => target.capabilities.includes(tool.capability)));
+          const review = await this.critic.validate(lastPlan, availableTools, {
+            exactFileSnapshots: this.memory.getTaskFileSnapshots(task.id),
+          });
           lastPlan = review.plan;
           task = this.transitionTask(task, 'validating');
           this.transitionRun(this.database.getRun(run.id) ?? run, 'validating');
@@ -1294,10 +1601,17 @@ export class AgentRuntime {
             this.metrics.recordFailure('plan_validation');
             this.memory.recordFailure(`plan:${run.id}`, { reason: review.feedback.join('; ') || 'Plan validation failed.' });
             const replanGuidance = buildReplanGuidance(review.feedback);
+            const salvagePlan = buildObservationSalvagePlan(lastPlan, availableTools);
+            const salvageResult =
+              salvagePlan === undefined
+                ? { executedSteps: 0, snapshotPaths: [] as string[] }
+                : await this.executeObservationSalvage(task, run, target, salvagePlan.steps, createdArtifacts);
             this.createRunEvent(task.id, run.id, 'error', 'plan_invalid', {
               feedback: review.feedback,
               failureClasses: replanGuidance.failureClasses,
               doNotRepeatRules: replanGuidance.doNotRepeatRules,
+              observationSalvageSteps: salvageResult.executedSteps,
+              observationSnapshotPaths: salvageResult.snapshotPaths,
             });
             this.finishRun(run, 'failed');
             task = this.transitionTask(task, 'failed');
@@ -1320,7 +1634,27 @@ export class AgentRuntime {
           const failureMessage = error instanceof Error ? error.message : 'Plan generation failed.';
           this.metrics.recordFailure('plan_generation');
           this.memory.recordFailure(`plan:${run.id}`, { reason: failureMessage });
-          this.createRunEvent(task.id, run.id, 'error', 'plan_generation_failed', { error: failureMessage });
+          const transportDiagnostic = this.createTransportDiagnosticPayload(error, 'task_plan');
+          let diagnosticPath: string | null = null;
+          if (error instanceof InvalidOperationError) {
+            diagnosticPath = this.createRunDiagnosticArtifact(run.id, 'planning-transport', {
+              contract: transportDiagnostic.eventPayload['contract'],
+              executable: transportDiagnostic.eventPayload['executable'],
+              model: transportDiagnostic.eventPayload['model'],
+              outputPath: transportDiagnostic.eventPayload['outputPath'],
+              responseExists: transportDiagnostic.eventPayload['responseExists'],
+              attempt: transportDiagnostic.eventPayload['attempt'],
+              maxAttempts: transportDiagnostic.eventPayload['maxAttempts'],
+              stdout: getStringDetail(error.details, 'stdout'),
+              stderr: getStringDetail(error.details, 'stderr'),
+              raw: getStringDetail(error.details, 'raw'),
+            });
+          }
+          this.createRunEvent(task.id, run.id, 'error', 'plan_generation_failed', {
+            error: failureMessage,
+            ...transportDiagnostic.eventPayload,
+            diagnosticPath,
+          });
           this.finishRun(run, 'failed');
           task = this.transitionTask(task, 'failed');
           const decision = await this.supervisor.decide({
@@ -1346,6 +1680,7 @@ export class AgentRuntime {
 
       task = this.transitionTask(task, 'executing');
       this.transitionRun(this.database.getRun(run.id) ?? run, 'executing');
+      executionStartedAt = Date.now();
 
       let hadFailure = false;
       let verifiedSteps = 0;
@@ -1386,7 +1721,7 @@ export class AgentRuntime {
                 input: step.input,
               },
               {
-                startedAt,
+                startedAt: executionStartedAt,
                 completedSteps: index,
                 changedFiles: this.getChangedFilesSet(run.id).size,
                 iteration,
@@ -1490,11 +1825,7 @@ export class AgentRuntime {
 
         if (verification.verified) {
           verifiedSteps += 1;
-          this.memory.recordSuccessfulPattern(step.tool, {
-            input: step.input,
-            target_id: task.target_id,
-            timestamp: new Date().toISOString(),
-          });
+          this.recordVerifiedStepMemory(task, run, completedStep, step, result);
         } else {
           hadFailure = true;
           failures.push(verification.evidence);

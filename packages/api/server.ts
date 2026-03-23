@@ -342,6 +342,11 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
         return;
       }
 
+      if (request.method === 'DELETE' && requestUrl.pathname === '/tasks') {
+        sendJson(response, 200, runtime.deleteAllTasks());
+        return;
+      }
+
       if (request.method === 'GET' && requestUrl.pathname.startsWith('/tasks/')) {
         const taskId = requestUrl.pathname.split('/')[2];
         if (requestUrl.pathname.endsWith('/view')) {
@@ -389,6 +394,12 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
         }
 
         sendJson(response, 200, runtime.inspectTask(taskId));
+        return;
+      }
+
+      if (request.method === 'DELETE' && requestUrl.pathname.startsWith('/tasks/')) {
+        const taskId = requestUrl.pathname.split('/')[2];
+        sendJson(response, 200, runtime.deleteTask(taskId));
         return;
       }
 

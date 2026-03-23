@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { memorySummarySchema, type MemoryEntryRecord, type MemorySummary } from '../domain';
+import { fileSnapshotMemorySchema, memorySummarySchema, type FileSnapshotMemory, type MemoryEntryRecord, type MemorySummary } from '../domain';
 import type { RuntimeDatabase } from '../db/database';
 
 const memoryObjectSchema = z.record(z.string(), z.unknown());
@@ -23,6 +23,16 @@ export class MemoryService {
       failure: takeRecent(this.db.listMemory('failure'), limit),
       semantic: takeRecent(this.db.listMemory('semantic'), limit),
     });
+  }
+
+  getTaskFileSnapshots(taskId: string, limit = 20): FileSnapshotMemory[] {
+    return this.db
+      .listMemory('semantic')
+      .map((entry) => parseMemoryValue(entry.value_json))
+      .filter((value) => fileSnapshotMemorySchema.safeParse(value).success)
+      .map((value) => fileSnapshotMemorySchema.parse(value))
+      .filter((value) => value.task_id === taskId)
+      .slice(0, limit);
   }
 
   recordRun(runId: string, summary: Record<string, unknown>): void {

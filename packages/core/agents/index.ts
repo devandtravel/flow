@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { CriticReview, MemorySummary, TaskPlan, ToolStep } from '../../domain';
+import type { CriticReview, FileSnapshotMemory, MemorySummary, TaskPlan, ToolStep } from '../../domain';
 import { evaluationSchema, supervisorDecisionSchema } from '../../domain';
 import type { LlmProvider } from '../../llm';
 import {
@@ -14,6 +14,8 @@ import {
   taskPlanResponseSchema,
 } from '../../llm/contracts';
 import type { ToolDefinition, ToolResult } from '../../tools';
+import { getContextualStepSemanticValidationError } from './contextual-step-validation';
+import type { StepValidationContext } from './contextual-step-validation';
 import { getStepSemanticValidationError } from './step-validation';
 
 function describeFailures(failures: string[]): string {
@@ -45,9 +47,15 @@ function createFallbackSupervisorDecision(input: {
 export class PlannerAgent {
   constructor(private readonly provider: LlmProvider) {}
 
-  async generate(input: { goal: string; memory: MemorySummary; tools: ToolDefinition[]; extraContext: string }): Promise<TaskPlan> {
+  async generate(input: {
+    goal: string;
+    memory: MemorySummary;
+    tools: ToolDefinition[];
+    extraContext: string;
+    exactFileSnapshots: FileSnapshotMemory[];
+  }): Promise<TaskPlan> {
     const response = await this.provider.complete({
-      prompt: buildPlanningPrompt(input.goal, input.memory, input.tools, input.extraContext),
+      prompt: buildPlanningPrompt(input.goal, input.memory, input.tools, input.extraContext, input.exactFileSnapshots),
       schema: taskPlanResponseSchema,
       contract: 'task_plan',
     });
@@ -58,7 +66,7 @@ export class PlannerAgent {
 export class CriticAgent {
   constructor(private readonly provider: LlmProvider) {}
 
-  async validate(plan: TaskPlan, availableTools: ToolDefinition[]): Promise<CriticReview> {
+  async validate(plan: TaskPlan, availableTools: ToolDefinition[], context: StepValidationContext): Promise<CriticReview> {
     const unknownTool = plan.steps.find((step) => availableTools.every((tool) => tool.name !== step.tool));
     if (unknownTool) {
       return decodeCriticReviewResponse(
@@ -107,8 +115,25 @@ export class CriticAgent {
       );
     }
 
+    const invalidContextualSemanticStep = plan.steps.find(
+      (step) => getContextualStepSemanticValidationError(step, context) !== undefined,
+    );
+    if (invalidContextualSemanticStep) {
+      return decodeCriticReviewResponse(
+        encodeCriticReviewResponse({
+          valid: false,
+          feedback: [
+            `Invalid contextual content for tool ${invalidContextualSemanticStep.tool}: ${
+              getContextualStepSemanticValidationError(invalidContextualSemanticStep, context) ?? 'Invalid content.'
+            }`,
+          ],
+          plan,
+        }),
+      );
+    }
+
     const response = await this.provider.complete({
-      prompt: buildCriticPrompt(plan, availableTools),
+      prompt: buildCriticPrompt(plan, availableTools, context.exactFileSnapshots),
       schema: criticReviewResponseSchema,
       contract: 'critic_review',
     });

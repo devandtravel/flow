@@ -379,7 +379,6 @@ button {
 
 .task-card,
 .artifact-card {
-  cursor: pointer;
   text-align: left;
   transition: transform 0.14s ease, border-color 0.14s ease, background 0.14s ease;
 }
@@ -397,6 +396,34 @@ button {
 .artifact-card:hover {
   transform: translateY(-1px);
   border-color: rgba(98, 192, 255, 0.32);
+}
+
+.task-card {
+  display: grid;
+  gap: 12px;
+}
+
+.task-card-main {
+  width: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.task-card-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.task-delete-button {
+  width: 100%;
+}
+
+body.compact .task-card {
+  gap: 10px;
 }
 
 .artifact-card {

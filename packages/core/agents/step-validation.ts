@@ -18,9 +18,13 @@ function isPlaceholderString(value: string): boolean {
   return reservedPlaceholderValues.has(value.trim().toLowerCase());
 }
 
+function isTemplatePlaceholderString(value: string): boolean {
+  return /^<[^>]*\s+[^>]*>$/.test(value.trim());
+}
+
 function containsPlaceholderValue(value: unknown): boolean {
   if (typeof value === 'string') {
-    return isPlaceholderString(value);
+    return isPlaceholderString(value) || isTemplatePlaceholderString(value);
   }
 
   if (Array.isArray(value)) {
@@ -77,6 +81,16 @@ function getPatchValidationError(step: ToolStep): string | undefined {
   const lines = patch.replaceAll('\r\n', '\n').split('\n');
   if (lines.some((line) => line.trim() === '...')) {
     return 'patch must not contain ellipses or omitted context markers.';
+  }
+
+  const hasTemplatePlaceholderLine = lines.some((line) => {
+    const normalizedLine = line.startsWith('+') || line.startsWith('-') || line.startsWith(' ')
+      ? line.slice(1).trim()
+      : line.trim();
+    return isTemplatePlaceholderString(normalizedLine);
+  });
+  if (hasTemplatePlaceholderLine) {
+    return 'patch must contain exact file content, not template placeholders wrapped in angle brackets.';
   }
 
   const firstLine = lines[0]?.trim() ?? '';

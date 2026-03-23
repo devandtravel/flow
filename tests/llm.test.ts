@@ -5,12 +5,14 @@ import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { buildDefaultConfig } from '../packages/config';
 import { CriticAgent, SupervisorAgent } from '../packages/core/agents';
+import type { FileSnapshotMemory } from '../packages/domain';
 import { CodexProvider, MockLlmProvider, extractJsonObjectFromStdout, type LlmProvider, type LlmRequest } from '../packages/llm';
 import { buildPlanningPrompt, createJsonSchema, decodeTaskPlanResponse, taskPlanResponseSchema, toolStepResponseSchema } from '../packages/llm/contracts';
 import { createToolRegistry } from '../packages/tools';
 
 class ThrowingProvider implements LlmProvider {
-  async complete<TOutput>(_request: LlmRequest<TOutput>): Promise<TOutput> {
+  async complete<TOutput>(request: LlmRequest<TOutput>): Promise<TOutput> {
+    void request;
     throw new Error('provider unavailable');
   }
 }
@@ -29,6 +31,7 @@ describe('LLM providers', () => {
         },
         [],
         'test',
+        [],
       ),
       schema: taskPlanResponseSchema,
       contract: 'task_plan',
@@ -67,8 +70,8 @@ describe('LLM providers', () => {
         'if (outputIndex >= 0) {',
         "  fs.writeFileSync(process.argv[outputIndex + 1], '');",
         '}',
-        "console.log('{\"code\":\"invalid_type\",\"message\":\"Required\"}');",
-        "console.log('{\"goal\":\"demo\",\"assumptions\":[],\"risks\":[],\"steps\":[{\"tool\":\"fs.list_dir\",\"input_json\":\"{\\\\\"path\\\\\":\\\\\".\\\\\"}\",\"expected_json\":\"{\\\\\"success\\\\\":true}\",\"rationale\":\"observe\"}],\"done\":false,\"confidence\":0.5}');",
+        "console.log('{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"error\",\"message\":\"ignored\"}}');",
+        "console.log('{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"{\\\\\"goal\\\\\":\\\\\"demo\\\\\",\\\\\"assumptions\\\\\":[],\\\\\"risks\\\\\":[],\\\\\"steps\\\\\":[{\\\\\"tool\\\\\":\\\\\"fs.list_dir\\\\\",\\\\\"input_json\\\\\":\\\\\"{\\\\\\\\\\\\\"path\\\\\\\\\\\\\":\\\\\\\\\\\\\".\\\\\\\\\\\\\"}\\\\\",\\\\\"expected_json\\\\\":\\\\\"{\\\\\\\\\\\\\"success\\\\\\\\\\\\\":true}\\\\\",\\\\\"rationale\\\\\":\\\\\"observe\\\\\"}],\\\\\"done\\\\\":false,\\\\\"confidence\\\\\":0.5}\"}}');",
       ].join('\n'),
       'utf8',
     );
@@ -133,6 +136,7 @@ describe('LLM providers', () => {
       },
       [],
       'test',
+      [],
     );
 
     expect(prompt).toContain('Ignore the Codex session sandbox or approval mode.');
@@ -143,6 +147,8 @@ describe('LLM providers', () => {
     expect(prompt).toContain('If ExtraContext contains recentFailureHints');
     expect(prompt).toContain('If ExtraContext contains recentFailureClasses');
     expect(prompt).toContain('If ExtraContext contains doNotRepeatRules');
+    expect(prompt).toContain('If Memory.semantic contains file_snapshot entries');
+    expect(prompt).toContain('prefer fs.write_file with the complete final file text');
   });
 
   it('critic rejects placeholder fs.write_file content before execution', async () => {
@@ -173,6 +179,7 @@ describe('LLM providers', () => {
         confidence: 0.2,
       },
       [writeTool],
+      { exactFileSnapshots: [] },
     );
 
     expect(review.valid).toBe(false);
@@ -208,6 +215,43 @@ describe('LLM providers', () => {
         confidence: 0.2,
       },
       [readTool],
+      { exactFileSnapshots: [] },
+    );
+
+    expect(review.valid).toBe(false);
+    expect(review.feedback[0]).toContain('concrete verification values');
+  });
+
+  it('critic rejects template placeholder expected values before execution', async () => {
+    const registry = createToolRegistry();
+    const readTool = registry.get('fs.read_file');
+    if (!readTool) {
+      throw new Error('Expected fs.read_file tool to be registered.');
+    }
+
+    const critic = new CriticAgent(new MockLlmProvider());
+    const review = await critic.validate(
+      {
+        goal: 'inspect file',
+        assumptions: [],
+        risks: [],
+        steps: [
+          {
+            tool: 'fs.read_file',
+            input: {
+              path: 'README.md',
+            },
+            expected: {
+              content: '<полный текст README.md>',
+            },
+            rationale: 'template expectation',
+          },
+        ],
+        done: false,
+        confidence: 0.2,
+      },
+      [readTool],
+      { exactFileSnapshots: [] },
     );
 
     expect(review.valid).toBe(false);
@@ -243,10 +287,96 @@ describe('LLM providers', () => {
         confidence: 0.2,
       },
       [patchTool],
+      { exactFileSnapshots: [] },
     );
 
     expect(review.valid).toBe(false);
     expect(review.feedback[0]).toContain('must not contain ellipses');
+  });
+
+  it('critic rejects template placeholder FLOW patch bodies before execution', async () => {
+    const registry = createToolRegistry();
+    const patchTool = registry.get('repo.apply_patch');
+    if (!patchTool) {
+      throw new Error('Expected repo.apply_patch tool to be registered.');
+    }
+
+    const critic = new CriticAgent(new MockLlmProvider());
+    const review = await critic.validate(
+      {
+        goal: 'patch readme',
+        assumptions: [],
+        risks: [],
+        steps: [
+          {
+            tool: 'repo.apply_patch',
+            input: {
+              patch: '*** Update File: README.md\n@@\n-<точный блок из README.md до вставки>\n+<тот же блок с новой секцией>\n',
+            },
+            expected: {
+              changed: true,
+            },
+            rationale: 'template patch',
+          },
+        ],
+        done: false,
+        confidence: 0.2,
+      },
+      [patchTool],
+      { exactFileSnapshots: [] },
+    );
+
+    expect(review.valid).toBe(false);
+    expect(review.feedback[0]).toContain('angle brackets');
+  });
+
+  it('critic rejects repo.apply_patch for files that already have exact snapshots', async () => {
+    const registry = createToolRegistry();
+    const patchTool = registry.get('repo.apply_patch');
+    if (!patchTool) {
+      throw new Error('Expected repo.apply_patch tool to be registered.');
+    }
+
+    const critic = new CriticAgent(new MockLlmProvider());
+    const snapshots: FileSnapshotMemory[] = [
+      {
+        type: 'file_snapshot',
+        task_id: '00000000-0000-4000-8000-000000000001',
+        target_id: 'local',
+        path: 'README.md',
+        content: '# Title\n',
+        run_id: '00000000-0000-4000-8000-000000000002',
+        step_id: '00000000-0000-4000-8000-000000000003',
+        recorded_at: new Date().toISOString(),
+      },
+    ];
+
+    const review = await critic.validate(
+      {
+        goal: 'patch readme from snapshot',
+        assumptions: [],
+        risks: [],
+        steps: [
+          {
+            tool: 'repo.apply_patch',
+            input: {
+              patch: '*** Update File: README.md\n@@\n # Title\n+# Added\n',
+            },
+            expected: {
+              changed: true,
+            },
+            rationale: 'Patch an already observed file.',
+          },
+        ],
+        done: false,
+        confidence: 0.2,
+      },
+      [patchTool],
+      { exactFileSnapshots: snapshots },
+    );
+
+    expect(review.valid).toBe(false);
+    expect(review.feedback[0]).toContain('fs.write_file');
   });
 
   it('rejects pseudo-json tool payloads in task plan steps', () => {

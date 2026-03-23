@@ -4,6 +4,7 @@ export const replanFailureClassSchema = z.enum([
   'placeholder_values',
   'full_file_text_required',
   'invalid_patch_format',
+  'snapshot_backed_write_required',
   'unknown_tool',
   'disabled_capability',
   'workspace_boundary',
@@ -32,6 +33,11 @@ const ruleDefinitions: ReplanRuleDefinition[] = [
     pattern: /No valid patches in input|hunk|patch/i,
     failureClass: 'invalid_patch_format',
     rule: 'Для repo.apply_patch используй только валидный FLOW patch или unified diff с точным контекстом после чтения файла.',
+  },
+  {
+    pattern: /file_snapshot memory|instead of repo\.apply_patch/i,
+    failureClass: 'snapshot_backed_write_required',
+    rule: 'Если exact file snapshot уже есть, не используй repo.apply_patch для этого файла; используй fs.write_file с полным итоговым текстом.',
   },
   {
     pattern: /Unknown tool/i,

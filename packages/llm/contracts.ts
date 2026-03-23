@@ -2,6 +2,7 @@ import { z } from 'zod';
 import {
   criticReviewSchema,
   type CriticReview,
+  type FileSnapshotMemory,
   type MemorySummary,
   type TaskPlan,
   taskPlanSchema,
@@ -187,7 +188,23 @@ export function createJsonSchema(contract: LlmContract): Record<string, unknown>
   };
 }
 
-export function buildPlanningPrompt(goal: string, memory: MemorySummary, tools: ToolDefinition[], extraContext: string): string {
+function formatExactFileSnapshots(exactFileSnapshots: FileSnapshotMemory[]): string {
+  return JSON.stringify(
+    exactFileSnapshots.map((snapshot) => ({
+      path: snapshot.path,
+      content: snapshot.content,
+      recorded_at: snapshot.recorded_at,
+    })),
+  );
+}
+
+export function buildPlanningPrompt(
+  goal: string,
+  memory: MemorySummary,
+  tools: ToolDefinition[],
+  extraContext: string,
+  exactFileSnapshots: FileSnapshotMemory[],
+): string {
   return [
     `FLOW Contract Version: ${promptContractVersion}`,
     'You are FLOW planner.',
@@ -198,9 +215,11 @@ export function buildPlanningPrompt(goal: string, memory: MemorySummary, tools: 
     'If ExtraContext contains recentFailureHints, use them to avoid repeating the same invalid plan pattern.',
     'If ExtraContext contains recentFailureClasses, interpret them as normalized failure categories and correct the plan accordingly.',
     'If ExtraContext contains doNotRepeatRules, follow them strictly and avoid generating any step that violates those rules.',
+    'If Memory.semantic contains file_snapshot entries, treat their content as the exact latest file text for planning edits.',
     '',
     `Goal: ${goal}`,
     `ExtraContext: ${extraContext}`,
+    `ExactFileSnapshots: ${formatExactFileSnapshots(exactFileSnapshots)}`,
     `Memory: ${JSON.stringify(memory)}`,
     `Tools: ${JSON.stringify(sanitizeToolCatalog(tools))}`,
     '',
@@ -225,12 +244,20 @@ export function buildPlanningPrompt(goal: string, memory: MemorySummary, tools: 
     '- for repo.apply_patch, never use guessed context, placeholder lines, ellipses, or synthetic markers',
     '- repo.apply_patch accepts either a valid unified diff or a FLOW patch that begins with "*** Update File:", "*** Add File:", or "*** Delete File:"',
     '- only emit repo.apply_patch after reading the exact target file content needed for a valid patch',
+    '- if ExactFileSnapshots already contain a file that you need to edit, do not use repo.apply_patch for that file; use fs.write_file with the complete final file text',
+    '- if file_snapshot memory is available for a target file, use that exact content when composing the edit step',
+    '- when file_snapshot memory is available and you need to rewrite a section, prefer fs.write_file with the complete final file text over a patch template',
     '- if exact patch context is not yet known, add a read step first instead of guessing the patch',
     '- when a safe append or replacement can be expressed more reliably through fs.read_file plus fs.write_file, prefer that sequence over a speculative patch',
+    '- for fs.read_file, expected_json should check a small observable property such as path or content_includes, not the entire file body',
   ].join('\n');
 }
 
-export function buildCriticPrompt(plan: TaskPlan, tools: ToolDefinition[]): string {
+export function buildCriticPrompt(
+  plan: TaskPlan,
+  tools: ToolDefinition[],
+  exactFileSnapshots: FileSnapshotMemory[],
+): string {
   return [
     `FLOW Contract Version: ${promptContractVersion}`,
     'You are FLOW critic.',
@@ -238,8 +265,11 @@ export function buildCriticPrompt(plan: TaskPlan, tools: ToolDefinition[]): stri
     'You are validating a FLOW runtime plan, not executing tools yourself.',
     'Ignore the Codex session sandbox or approval mode. They do not limit FLOW tool execution.',
     'A write-capable step is valid when it uses an allowed FLOW tool and follows the task constraints.',
+    'If ExactFileSnapshots contains the current exact file text for a target file, a full fs.write_file rewrite derived from that snapshot is valid and preferred over a speculative patch.',
+    'Do not reject fs.write_file solely because it writes the whole file when that file is already present in ExactFileSnapshots for this task.',
     `Plan: ${JSON.stringify(plan)}`,
     `AvailableTools: ${JSON.stringify(sanitizeToolCatalog(tools))}`,
+    `ExactFileSnapshots: ${formatExactFileSnapshots(exactFileSnapshots)}`,
     'If the plan is invalid, preserve it and explain the problem in feedback.',
   ].join('\n');
 }

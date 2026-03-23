@@ -24,7 +24,9 @@ function renderRun(run) {
   ].join('');
 }
 
-function renderOverview(taskView, maintenance, metrics) {
+function renderOverview(taskView, maintenance, metrics, tasks) {
+  const deletableTaskCount = Array.isArray(tasks) ? tasks.filter(isTaskDeletable).length : 0;
+  const allTasksDeletable = Array.isArray(tasks) && tasks.length > 0 && deletableTaskCount === tasks.length;
   const overviewBody = !taskView || !taskView.task
     ? '<section class="panel stack"><div class="empty">' + escapeHtml(copy.noTaskSelected) + '</div></section>'
     : [
@@ -40,7 +42,11 @@ function renderOverview(taskView, maintenance, metrics) {
 
   return [
     '<section class="split">',
-    '<section class="panel stack"><div class="toolbar spread"><h2>' + escapeHtml(copy.tasks) + '</h2>' + renderPill('Активный список', '') + '</div><div id="tasksList" class="list"></div></section>',
+    '<section class="panel stack"><div class="toolbar spread"><div class="stack gap-xs"><h2>' + escapeHtml(copy.tasks) + '</h2><div class="meta">' + escapeHtml(copy.taskDeletionPolicy) + '</div></div><div class="toolbar">' +
+      renderPill(String(Array.isArray(tasks) ? tasks.length : 0), '') +
+      '<button type="button" class="button danger" data-delete-all-tasks="true"' + (allTasksDeletable ? '' : ' disabled') + '>' +
+      escapeHtml(allTasksDeletable ? copy.deleteAllTasks : copy.deleteAllTasksUnavailable) +
+      '</button></div></div><div id="tasksList" class="list"></div></section>',
     '<section class="stack">' + overviewBody + '</section>',
     '</section>',
     renderFilterBar(),

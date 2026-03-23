@@ -69,6 +69,22 @@ export interface TaskArtifactPageRow extends ArtifactRecord {
   tool: string;
 }
 
+export interface TaskDeletionSummary {
+  taskId: string;
+  runIds: string[];
+  artifactPaths: string[];
+  deletedCounts: {
+    approvals: number;
+    artifacts: number;
+    evaluations: number;
+    memoryEntries: number;
+    runEvents: number;
+    runs: number;
+    steps: number;
+    task: number;
+  };
+}
+
 const rawRowArraySchema = z.array(z.unknown());
 
 function stringifyJson(value: JsonObject): string {
@@ -90,6 +106,15 @@ function parseNullableRecord<T>(schema: z.ZodType<T>, value: unknown): T | undef
   }
 
   return parseObjectRow(schema, value);
+}
+
+function parseJsonRecord(value: string): JsonObject | undefined {
+  try {
+    const parsed = JSON.parse(value);
+    return z.record(z.string(), z.unknown()).parse(parsed);
+  } catch {
+    return undefined;
+  }
 }
 
 function buildAgeCutoffIso(maxAgeDays: number | null | undefined): string | undefined {
@@ -568,6 +593,13 @@ export class RuntimeDatabase {
     return parseArrayRows(approvalRequestRecordSchema, this.sqlite.prepare('SELECT * FROM approval_requests ORDER BY created_at DESC').all());
   }
 
+  listApprovalsByTask(taskId: string): ApprovalRequestRecord[] {
+    return parseArrayRows(
+      approvalRequestRecordSchema,
+      this.sqlite.prepare('SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC').all(taskId),
+    );
+  }
+
   findApprovedApprovalForTask(taskId: string): ApprovalRequestRecord | undefined {
     return parseNullableRecord(
       approvalRequestRecordSchema,
@@ -836,6 +868,110 @@ export class RuntimeDatabase {
         offset: resolvedPage.offset,
       },
       runs,
+    };
+  }
+
+  private collectTaskMemoryEntryIds(taskId: string, runIds: string[], stepIds: string[]): string[] {
+    const runIdSet = new Set(runIds);
+    const stepIdSet = new Set(stepIds);
+    const memoryIds = new Set<string>();
+    const memoryEntries = this.listMemory();
+
+    for (const entry of memoryEntries) {
+      if (entry.scope === 'episodic' && entry.key.startsWith('run:') && runIdSet.has(entry.key.slice(4))) {
+        memoryIds.add(entry.id);
+        continue;
+      }
+
+      if (entry.scope === 'failure' && entry.key.startsWith('plan:') && runIdSet.has(entry.key.slice(5))) {
+        memoryIds.add(entry.id);
+        continue;
+      }
+
+      if (entry.scope === 'failure' && entry.key.startsWith('step:') && stepIdSet.has(entry.key.slice(5))) {
+        memoryIds.add(entry.id);
+        continue;
+      }
+
+      if (entry.scope === 'semantic' && entry.key.startsWith(`file:${taskId}:`)) {
+        memoryIds.add(entry.id);
+        continue;
+      }
+
+      const value = parseJsonRecord(entry.value_json);
+      if (!value) {
+        continue;
+      }
+
+      const relatedTaskId = value['task_id'];
+      if (typeof relatedTaskId === 'string' && relatedTaskId === taskId) {
+        memoryIds.add(entry.id);
+      }
+    }
+
+    return Array.from(memoryIds);
+  }
+
+  deleteTaskCascade(taskId: string): TaskDeletionSummary {
+    const task = this.getTask(taskId);
+    if (!task) {
+      throw new NotFoundError(`Task ${taskId} not found.`, { taskId });
+    }
+
+    const runs = this.listRunsByTask(taskId);
+    const runIds = runs.map((run) => run.id);
+    const steps = runs.flatMap((run) => this.listStepsByRun(run.id));
+    const stepIds = steps.map((step) => step.id);
+    const artifacts = steps.flatMap((step) => this.listArtifactsByStep(step.id));
+    const approvals = this.listApprovalsByTask(taskId);
+    const evaluations = runs.flatMap((run) => this.listEvaluationsByRun(run.id));
+    const runEvents = runs.flatMap((run) => this.listRunEvents(run.id));
+    const memoryEntryIds = this.collectTaskMemoryEntryIds(taskId, runIds, stepIds);
+
+    this.sqlite.exec('BEGIN');
+    try {
+      for (const artifact of artifacts) {
+        this.sqlite.prepare('DELETE FROM artifacts WHERE id = ?').run(artifact.id);
+      }
+      for (const step of steps) {
+        this.sqlite.prepare('DELETE FROM steps WHERE id = ?').run(step.id);
+      }
+      for (const evaluation of evaluations) {
+        this.sqlite.prepare('DELETE FROM evaluations WHERE id = ?').run(evaluation.id);
+      }
+      for (const runEvent of runEvents) {
+        this.sqlite.prepare('DELETE FROM run_events WHERE id = ?').run(runEvent.id);
+      }
+      for (const approval of approvals) {
+        this.sqlite.prepare('DELETE FROM approval_requests WHERE id = ?').run(approval.id);
+      }
+      for (const memoryEntryId of memoryEntryIds) {
+        this.sqlite.prepare('DELETE FROM memory_entries WHERE id = ?').run(memoryEntryId);
+      }
+      for (const run of runs) {
+        this.sqlite.prepare('DELETE FROM runs WHERE id = ?').run(run.id);
+      }
+      this.sqlite.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
+      this.sqlite.exec('COMMIT');
+    } catch (error) {
+      this.sqlite.exec('ROLLBACK');
+      throw error;
+    }
+
+    return {
+      taskId,
+      runIds,
+      artifactPaths: artifacts.map((artifact) => artifact.path),
+      deletedCounts: {
+        approvals: approvals.length,
+        artifacts: artifacts.length,
+        evaluations: evaluations.length,
+        memoryEntries: memoryEntryIds.length,
+        runEvents: runEvents.length,
+        runs: runs.length,
+        steps: steps.length,
+        task: 1,
+      },
     };
   }
 

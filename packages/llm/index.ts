@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -26,6 +26,11 @@ export interface LlmProvider {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function getStringRecordValue(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === 'string' ? value : undefined;
 }
 
 export function extractJsonObjectFromStdout(stdout: string): string | undefined {
@@ -61,23 +66,6 @@ export function extractJsonObjectFromStdout(stdout: string): string | undefined 
   }
 
   return undefined;
-}
-
-function extractJsonObjectCandidates(text: string): string[] {
-  const candidates: string[] = [];
-  const seen = new Set<string>();
-
-  for (let start = text.lastIndexOf('{'); start >= 0; start = text.lastIndexOf('{', start - 1)) {
-    const candidate = findJsonObjectAt(text, start);
-    if (!candidate || seen.has(candidate)) {
-      continue;
-    }
-
-    seen.add(candidate);
-    candidates.push(candidate);
-  }
-
-  return candidates;
 }
 
 function extractLastJsonObjectCandidate(text: string): string | undefined {
@@ -139,6 +127,38 @@ function findJsonObjectAt(text: string, startIndex: number): string | undefined 
   return undefined;
 }
 
+function extractAgentMessageTextCandidates(text: string): string[] {
+  const candidates: string[] = [];
+
+  for (const line of text.split('\n')) {
+    const trimmedLine = line.trim();
+    if (!trimmedLine.startsWith('{')) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmedLine);
+      if (!isRecord(parsed) || parsed['type'] !== 'item.completed') {
+        continue;
+      }
+
+      const item = parsed['item'];
+      if (!isRecord(item) || item['type'] !== 'agent_message') {
+        continue;
+      }
+
+      const textCandidate = getStringRecordValue(item, 'text');
+      if (textCandidate && textCandidate.length > 0) {
+        candidates.push(textCandidate);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return candidates;
+}
+
 function getStructuredOutputCandidates(
   outputPath: string,
   execution: { stdout: string; stderr: string },
@@ -154,16 +174,7 @@ function getStructuredOutputCandidates(
     }
   }
 
-  for (const candidate of extractJsonObjectCandidates(execution.stdout)) {
-    if (seen.has(candidate)) {
-      continue;
-    }
-
-    seen.add(candidate);
-    candidates.push(candidate);
-  }
-
-  for (const candidate of extractJsonObjectCandidates(execution.stderr)) {
+  for (const candidate of extractAgentMessageTextCandidates(execution.stdout)) {
     if (seen.has(candidate)) {
       continue;
     }
@@ -202,24 +213,6 @@ function buildStructuredOutputRetryPrompt(basePrompt: string): string {
     'The previous attempt did not satisfy the structured output contract.',
     'Return exactly one JSON object that matches the schema and do not add prose, commentary, or markdown.',
   ].join('\n');
-}
-
-function createIsolatedCodexHome(rootDirectory: string): string {
-  const codexHome = path.join(rootDirectory, 'codex-home');
-  mkdirSync(codexHome, { recursive: true });
-  writeFileSync(
-    path.join(codexHome, 'config.toml'),
-    [
-      'approval_policy = "never"',
-      'sandbox_mode = "read-only"',
-      '[features]',
-      'apps = false',
-      'tui_app_server = false',
-      'multi_agent = false',
-    ].join('\n'),
-    'utf8',
-  );
-  return codexHome;
 }
 
 function createHeuristicPlan(goal: string): TaskPlan {
@@ -345,7 +338,6 @@ export class CodexProvider implements LlmProvider {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const outputDirectory = mkdtempSync(path.join(os.tmpdir(), 'flow-codex-'));
-      const codexHome = createIsolatedCodexHome(outputDirectory);
       const outputPath = path.join(outputDirectory, 'response.json');
       const schemaPath = path.join(outputDirectory, 'schema.json');
       writeFileSync(schemaPath, JSON.stringify(createJsonSchema(request.contract), null, 2));
@@ -364,6 +356,7 @@ export class CodexProvider implements LlmProvider {
         'features.tui_app_server=false',
         '-c',
         'model_reasoning_effort="medium"',
+        '--json',
         '--output-schema',
         schemaPath,
         '--output-last-message',
@@ -376,10 +369,6 @@ export class CodexProvider implements LlmProvider {
       const execution = spawnSync(this.config.executable, args, {
         encoding: 'utf8',
         timeout: this.config.timeout_ms,
-        env: {
-          ...process.env,
-          CODEX_HOME: codexHome,
-        },
       });
 
       if (execution.status !== 0) {
@@ -389,6 +378,7 @@ export class CodexProvider implements LlmProvider {
           status: execution.status,
           stdout: execution.stdout,
           stderr: execution.stderr,
+          responseExists: existsSync(outputPath),
           attempt,
           maxAttempts,
         });
@@ -406,6 +396,7 @@ export class CodexProvider implements LlmProvider {
           stdout: execution.stdout,
           stderr: execution.stderr,
           outputPath,
+          responseExists: existsSync(outputPath),
           attempt,
           maxAttempts,
         });
@@ -431,6 +422,7 @@ export class CodexProvider implements LlmProvider {
               stdout: execution.stdout,
               stderr: execution.stderr,
               outputPath,
+              responseExists: existsSync(outputPath),
               raw,
               attempt,
               maxAttempts,
@@ -445,6 +437,7 @@ export class CodexProvider implements LlmProvider {
         stdout: execution.stdout,
         stderr: execution.stderr,
         outputPath,
+        responseExists: existsSync(outputPath),
         attempt,
         maxAttempts,
       });
