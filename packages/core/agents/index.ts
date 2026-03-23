@@ -23,6 +23,38 @@ function describeFailures(failures: string[]): string {
   return failures.join('; ');
 }
 
+function getStepSemanticValidationError(step: ToolStep): string | undefined {
+  if (step.tool !== 'fs.write_file') {
+    return undefined;
+  }
+
+  const content = step.input['content'];
+  if (typeof content !== 'string') {
+    return 'content must be a string.';
+  }
+
+  const normalizedContent = content.trim().toLowerCase();
+  const reservedPlaceholderValues = new Set([
+    'string',
+    'number',
+    'boolean',
+    'object',
+    'array',
+    'null',
+    'undefined',
+  ]);
+
+  if (reservedPlaceholderValues.has(normalizedContent)) {
+    return 'content must contain the full file text, not a schema placeholder.';
+  }
+
+  if (/^updated .+ content\b/.test(normalizedContent)) {
+    return 'content must contain the final file body, not a summary of the intended change.';
+  }
+
+  return undefined;
+}
+
 export class PlannerAgent {
   constructor(private readonly provider: LlmProvider) {}
 
@@ -46,6 +78,43 @@ export class CriticAgent {
         encodeCriticReviewResponse({
         valid: false,
         feedback: [`Unknown tool in plan: ${unknownTool.tool}`],
+          plan,
+        }),
+      );
+    }
+
+    const invalidInputStep = plan.steps.find((step) => {
+      const tool = availableTools.find((availableTool) => availableTool.name === step.tool);
+      if (!tool) {
+        return false;
+      }
+
+      return !tool.inputSchema.safeParse(step.input).success;
+    });
+    if (invalidInputStep) {
+      const tool = availableTools.find((availableTool) => availableTool.name === invalidInputStep.tool);
+      const validation = tool ? tool.inputSchema.safeParse(invalidInputStep.input) : null;
+      const validationMessage =
+        validation && !validation.success
+          ? validation.error.issues.map((issue) => `${issue.path.join('.') || 'input'}: ${issue.message}`).join('; ')
+          : 'Invalid tool input.';
+      return decodeCriticReviewResponse(
+        encodeCriticReviewResponse({
+          valid: false,
+          feedback: [`Invalid input for tool ${invalidInputStep.tool}: ${validationMessage}`],
+          plan,
+        }),
+      );
+    }
+
+    const invalidSemanticStep = plan.steps.find((step) => getStepSemanticValidationError(step) !== undefined);
+    if (invalidSemanticStep) {
+      return decodeCriticReviewResponse(
+        encodeCriticReviewResponse({
+          valid: false,
+          feedback: [
+            `Invalid semantic content for tool ${invalidSemanticStep.tool}: ${getStepSemanticValidationError(invalidSemanticStep) ?? 'Invalid content.'}`,
+          ],
           plan,
         }),
       );

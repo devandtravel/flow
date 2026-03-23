@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { capabilityNameSchema } from '../domain';
 import { ValidationError } from '../errors';
 import type { PolicyEngine } from '../policy';
+import { applyFlowPatch, getFlowPatchChangedFiles, isFlowPatchFormat } from './flow-patch';
 
 export const directoryEntrySchema = z.object({
   name: z.string().min(1),
@@ -48,6 +49,7 @@ export interface ToolDefinition {
   reversibility: 'reversible' | 'irreversible';
   approvalClass: 'never' | 'sensitive' | 'destructive';
   inputSchema: z.ZodType<unknown>;
+  inputContract: Record<string, string>;
   execute(input: unknown, context: ToolExecutionContext): Promise<ToolResult>;
 }
 
@@ -129,6 +131,10 @@ function runCommand(workspaceRoot: string, command: string, args: string[], stdi
 }
 
 function extractChangedFilesFromPatch(patch: string): string[] {
+  if (isFlowPatchFormat(patch)) {
+    return getFlowPatchChangedFiles(patch);
+  }
+
   const changedFiles = new Set<string>();
   for (const line of patch.split('\n')) {
     if (line.startsWith('+++ b/')) {
@@ -184,6 +190,9 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       reversibility: 'reversible',
       approvalClass: 'never',
       inputSchema: readFileInputSchema,
+      inputContract: {
+        path: 'string, required, workspace-relative file path',
+      },
       async execute(input, context) {
         try {
           const parsed = readFileInputSchema.parse(input);
@@ -209,6 +218,10 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       reversibility: 'reversible',
       approvalClass: 'sensitive',
       inputSchema: writeFileInputSchema,
+      inputContract: {
+        path: 'string, required, workspace-relative file path',
+        content: 'string, required, full UTF-8 file content to write',
+      },
       async execute(input, context) {
         try {
           const parsed = writeFileInputSchema.parse(input);
@@ -237,6 +250,9 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       reversibility: 'reversible',
       approvalClass: 'never',
       inputSchema: listDirectoryInputSchema,
+      inputContract: {
+        path: 'string, optional, directory path, defaults to "."',
+      },
       async execute(input, context) {
         try {
           const parsed = listDirectoryInputSchema.parse(input);
@@ -268,6 +284,7 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       reversibility: 'reversible',
       approvalClass: 'never',
       inputSchema: z.object({}),
+      inputContract: {},
       async execute(_input, context) {
         return runCommand(context.workspaceRoot, 'git', ['status', '--short']);
       },
@@ -280,6 +297,9 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       reversibility: 'reversible',
       approvalClass: 'sensitive',
       inputSchema: gitBranchInputSchema,
+      inputContract: {
+        branch: 'string, required, valid git branch name',
+      },
       async execute(input, context) {
         const parsed = gitBranchInputSchema.parse(input);
         return runCommand(context.workspaceRoot, 'git', ['checkout', '-b', parsed.branch]);
@@ -293,6 +313,9 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       reversibility: 'irreversible',
       approvalClass: 'destructive',
       inputSchema: gitCommitInputSchema,
+      inputContract: {
+        message: 'string, required, commit message',
+      },
       async execute(input, context) {
         const parsed = gitCommitInputSchema.parse(input);
         const addResult = runCommand(context.workspaceRoot, 'git', ['add', '.']);
@@ -322,6 +345,7 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       reversibility: 'reversible',
       approvalClass: 'never',
       inputSchema: z.object({}),
+      inputContract: {},
       async execute(_input, context) {
         const usePnpm = existsSync(path.join(context.workspaceRoot, 'pnpm-lock.yaml'));
         return runCommand(context.workspaceRoot, usePnpm ? 'corepack' : 'npm', usePnpm ? ['pnpm', 'test'] : ['run', 'test']);
@@ -335,6 +359,7 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       reversibility: 'reversible',
       approvalClass: 'never',
       inputSchema: z.object({}),
+      inputContract: {},
       async execute(_input, context) {
         const usePnpm = existsSync(path.join(context.workspaceRoot, 'pnpm-lock.yaml'));
         return runCommand(context.workspaceRoot, usePnpm ? 'corepack' : 'npm', usePnpm ? ['pnpm', 'build'] : ['run', 'build']);
@@ -348,6 +373,7 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       reversibility: 'reversible',
       approvalClass: 'never',
       inputSchema: z.object({}),
+      inputContract: {},
       async execute(_input, context) {
         const usePnpm = existsSync(path.join(context.workspaceRoot, 'pnpm-lock.yaml'));
         if (usePnpm && existsSync(path.join(context.workspaceRoot, 'package.json'))) {
@@ -363,28 +389,48 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
     },
     {
       name: 'repo.apply_patch',
-      description: 'Apply a unified diff patch to the repository.',
+      description: 'Apply a repository patch in unified diff format or FLOW patch format.',
       capability: 'repo.patch',
       sideEffectClass: 'write',
       reversibility: 'reversible',
       approvalClass: 'sensitive',
       inputSchema: patchInputSchema,
+      inputContract: {
+        patch: 'string, required, valid unified diff patch or FLOW patch format beginning with "*** Update File:", "*** Add File:", or "*** Delete File:"',
+      },
       async execute(input, context) {
-        const parsed = patchInputSchema.parse(input);
-        const patchResult = runCommand(context.workspaceRoot, 'git', ['apply', '--whitespace=nowarn', '-'], parsed.patch);
-        if (!patchResult.success) {
-          return patchResult;
-        }
+        try {
+          const parsed = patchInputSchema.parse(input);
+          if (isFlowPatchFormat(parsed.patch)) {
+            const changedFiles = applyFlowPatch(parsed.patch, context.workspaceRoot, context.policy);
+            return successResult(
+              {
+                format: 'flow_patch',
+                changed_file_count: changedFiles.length,
+              },
+              'Applied repository patch.',
+              changedFiles,
+            );
+          }
 
-        const changedFiles = extractChangedFilesFromPatch(parsed.patch);
-        return successResult(
-          {
-            ...patchResult.output,
-            changed_file_count: changedFiles.length,
-          },
-          'Applied repository patch.',
-          changedFiles,
-        );
+          const patchResult = runCommand(context.workspaceRoot, 'git', ['apply', '--whitespace=nowarn', '-'], parsed.patch);
+          if (!patchResult.success) {
+            return patchResult;
+          }
+
+          const changedFiles = extractChangedFilesFromPatch(parsed.patch);
+          return successResult(
+            {
+              ...patchResult.output,
+              format: 'unified_diff',
+              changed_file_count: changedFiles.length,
+            },
+            'Applied repository patch.',
+            changedFiles,
+          );
+        } catch (error) {
+          return failureResult(error instanceof Error ? error.message : 'Unknown patch application error.');
+        }
       },
     },
     {
@@ -395,6 +441,10 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       reversibility: 'reversible',
       approvalClass: 'never',
       inputSchema: httpInputSchema,
+      inputContract: {
+        url: 'string, required, absolute URL inside the allowlist',
+        method: 'string, optional, one of GET or HEAD',
+      },
       async execute(input, context) {
         try {
           const parsed = httpInputSchema.parse(input);
@@ -430,6 +480,10 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       reversibility: 'irreversible',
       approvalClass: 'destructive',
       inputSchema: shellInputSchema,
+      inputContract: {
+        command: 'string, required, executable name',
+        args: 'string array, optional, command arguments',
+      },
       async execute(input, context) {
         const parsed = shellInputSchema.parse(input);
         if (!statSync(context.workspaceRoot).isDirectory()) {

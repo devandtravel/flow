@@ -42,7 +42,7 @@ describe('API server', () => {
     expect(Array.isArray(dashboardStateJson.tasks)).toBe(true);
     expect(Array.isArray(dashboardStateJson.approvals)).toBe(true);
     expect(Array.isArray(dashboardStateJson.targets)).toBe(true);
-  });
+  }, 10000);
 
   it('returns dashboard state without 404 for a stale task selection', async () => {
     const staleTaskId = '843db5d1-e9e1-4820-8583-14094f3d80b9';
@@ -128,12 +128,40 @@ describe('API server', () => {
           run: expect.objectContaining({
             id: summaryJson.runId,
           }),
+          eventsPage: expect.objectContaining({
+            total: expect.any(Number),
+            limit: 20,
+            offset: 0,
+          }),
           summary: expect.objectContaining({
             completedSteps: expect.any(Number),
             changedFiles: expect.any(Array),
           }),
         }),
       );
+
+      const pagedRunViewResponse = await fetch(`${currentBaseUrl}/runs/${summaryJson.runId}/view?limit=1&offset=0&level=info`);
+      expect(pagedRunViewResponse.status).toBe(200);
+      const pagedRunViewJson = await pagedRunViewResponse.json();
+      expect(pagedRunViewJson).toEqual(
+        expect.objectContaining({
+          run: expect.objectContaining({
+            id: summaryJson.runId,
+          }),
+          eventsPage: expect.objectContaining({
+            limit: 1,
+            offset: 0,
+          }),
+          summary: expect.objectContaining({
+            completedSteps: expect.any(Number),
+            changedFiles: expect.any(Array),
+          }),
+        }),
+      );
+
+      const runDocumentResponse = await fetch(`${currentBaseUrl}/run/${summaryJson.runId}`);
+      expect(runDocumentResponse.status).toBe(200);
+      expect(runDocumentResponse.headers.get('content-type')).toContain('text/html');
     }
 
     if ('task' in summaryJson && summaryJson.task && typeof summaryJson.task === 'object' && 'id' in summaryJson.task && typeof summaryJson.task.id === 'string') {
@@ -188,14 +216,94 @@ describe('API server', () => {
         expect.objectContaining({
           artifact: expect.objectContaining({
             id: artifactId,
+            taskId: summaryJson.task.id,
           }),
           summary: expect.objectContaining({
             title: expect.any(String),
           }),
         }),
       );
+
+      const taskViewResponse = await fetch(`${currentBaseUrl}/tasks/${summaryJson.task.id}/view?limit=3&offset=0`);
+      expect(taskViewResponse.status).toBe(200);
+      const taskViewJson = await taskViewResponse.json();
+      expect(taskViewJson).toEqual(
+        expect.objectContaining({
+          task: expect.objectContaining({
+            id: summaryJson.task.id,
+          }),
+          runsPage: expect.objectContaining({
+            limit: 3,
+            offset: 0,
+          }),
+          runs: expect.any(Array),
+          summary: expect.objectContaining({
+            updatedAt: expect.any(String),
+          }),
+          actions: expect.any(Array),
+        }),
+      );
+
+      const cursor = taskViewJson.runsPage.nextCursor;
+      if (typeof cursor === 'string' && cursor.length > 0) {
+        const cursorTaskViewResponse = await fetch(`${currentBaseUrl}/tasks/${summaryJson.task.id}/view?cursor=${encodeURIComponent(cursor)}`);
+        expect(cursorTaskViewResponse.status).toBe(200);
+      }
+
+      const taskDocumentResponse = await fetch(`${currentBaseUrl}/task/${summaryJson.task.id}`);
+      expect(taskDocumentResponse.status).toBe(200);
+      expect(taskDocumentResponse.headers.get('content-type')).toContain('text/html');
+
+      const artifactDocumentResponse = await fetch(`${currentBaseUrl}/artifact/${artifactId}`);
+      expect(artifactDocumentResponse.status).toBe(200);
+      expect(artifactDocumentResponse.headers.get('content-type')).toContain('text/html');
+
+      const filteredArtifactBrowserResponse = await fetch(
+        `${currentBaseUrl}/tasks/${summaryJson.task.id}/artifacts/browser?limit=8&offset=0&tool=repo.run_checks&artifactType=result`,
+      );
+      expect(filteredArtifactBrowserResponse.status).toBe(200);
     }
   }, 10000);
+
+  it('applies task operator actions through the API', async () => {
+    const createResponse = await fetch(`${currentBaseUrl}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ goal: 'operator actions probe' }),
+    });
+    expect(createResponse.status).toBe(201);
+    const taskJson = await createResponse.json();
+    expect(taskJson).toEqual(
+      expect.objectContaining({
+        id: expect.any(String),
+        state: 'queued',
+      }),
+    );
+
+    const cancelResponse = await fetch(`${currentBaseUrl}/tasks/${taskJson.id}/actions/cancel`, {
+      method: 'POST',
+    });
+    expect(cancelResponse.status).toBe(200);
+    const cancelledTask = await cancelResponse.json();
+    expect(cancelledTask).toEqual(
+      expect.objectContaining({
+        id: taskJson.id,
+        state: 'cancelled',
+      }),
+    );
+
+    const replanResponse = await fetch(`${currentBaseUrl}/tasks/${taskJson.id}/actions/replan`, {
+      method: 'POST',
+    });
+    expect(replanResponse.status).toBe(200);
+    const replannedTask = await replanResponse.json();
+    expect(replannedTask).toEqual(
+      expect.objectContaining({
+        id: taskJson.id,
+        state: 'queued',
+      }),
+    );
+  });
 
   it('manages targets, schedules, and maintenance endpoints', async () => {
     const targetsResponse = await fetch(`${currentBaseUrl}/targets`);

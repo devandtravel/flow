@@ -1,42 +1,10 @@
+import { dashboardArtifactViewsScript } from './artifacts';
+import { dashboardCopyScript } from './copy';
+import { dashboardRouteStateScript } from './routes';
+import { dashboardTaskViewsScript } from './task-views';
+
 export const dashboardScript = `
-const copy = {
-  title: 'FLOW Control Plane',
-  subtitle: 'Понятный контроль задач, approvals, артефактов и логов без сырого шума',
-  createTask: 'Новая задача',
-  goalLabel: 'Goal',
-  targetLabel: 'Target',
-  createButton: 'Создать задачу',
-  refreshButton: 'Обновить',
-  approvals: 'Approvals',
-  tasks: 'Задачи',
-  runtime: 'Runtime',
-  selectedTask: 'Выбранная задача',
-  noTaskSelected: 'Выбери задачу слева, чтобы увидеть историю, шаги и артефакты.',
-  maintenance: 'Maintenance',
-  targets: 'Targets',
-  schedules: 'Schedules',
-  loading: 'Обновляю состояние FLOW...',
-  viewOverview: 'Overview',
-  viewArtifacts: 'Artifacts',
-  viewLogs: 'Logs',
-  viewRun: 'Run',
-  pausePolling: 'Pause polling',
-  resumePolling: 'Resume polling',
-  noArtifacts: 'Для выбранной задачи артефактов пока нет.',
-  noLogs: 'Логи пока пусты.',
-  rawDetails: 'Показать технические детали',
-  hiddenNoise: 'Сырые payload и JSON скрыты, но доступны по требованию.',
-  dashboardReady: 'Control Plane готов к работе.',
-  streamConnected: 'Live stream connected',
-  streamConnecting: 'Connecting stream…',
-  streamPaused: 'Live updates paused',
-  filterTasks: 'Task state',
-  filterEvents: 'Event level',
-  filterApprovals: 'Approval status',
-  allStates: 'All states',
-  allLevels: 'All levels',
-  allApprovals: 'All approvals',
-};
+${dashboardCopyScript}
 
 const terminalStates = ['completed', 'failed', 'escalated', 'blocked', 'cancelled', 'rolled_back'];
 const storageKeys = {
@@ -44,6 +12,7 @@ const storageKeys = {
   selectedRunId: 'flow.ui.selectedRunId',
   selectedArtifactId: 'flow.ui.selectedArtifactId',
   activeView: 'flow.ui.activeView',
+  compactMode: 'flow.ui.compactMode',
   pollingPaused: 'flow.ui.pollingPaused',
   taskFilter: 'flow.ui.taskFilter',
   eventLevelFilter: 'flow.ui.eventLevelFilter',
@@ -60,6 +29,7 @@ const state = {
   refreshInFlight: false,
   shellReady: false,
   activeView: 'overview',
+  compactMode: false,
   lastUpdatedAt: '',
   lastError: '',
   streamConnected: false,
@@ -67,8 +37,9 @@ const state = {
   taskFilter: '',
   eventLevelFilter: '',
   approvalFilter: '',
-  runPageOffset: 0,
-  artifactPageOffset: 0,
+  taskRunCursor: '',
+  runEventCursor: '',
+  artifactCursor: '',
   lastLoadedData: null,
 };
 
@@ -103,90 +74,7 @@ function safeWriteStorage(key, value) {
   } catch {}
 }
 
-function loadPersistedState() {
-  const storedTaskId = safeReadStorage(storageKeys.selectedTaskId);
-  const storedView = safeReadStorage(storageKeys.activeView);
-  const storedPolling = safeReadStorage(storageKeys.pollingPaused);
-  const storedTaskFilter = safeReadStorage(storageKeys.taskFilter);
-  const storedEventLevelFilter = safeReadStorage(storageKeys.eventLevelFilter);
-  const storedApprovalFilter = safeReadStorage(storageKeys.approvalFilter);
-  const storedArtifactId = safeReadStorage(storageKeys.selectedArtifactId);
-  if (storedTaskId) {
-    state.selectedTaskId = storedTaskId;
-  }
-  const storedRunId = safeReadStorage(storageKeys.selectedRunId);
-  if (storedView === 'overview' || storedView === 'artifacts' || storedView === 'logs' || storedView === 'run') {
-    state.activeView = storedView;
-  }
-  if (storedRunId) {
-    state.selectedRunId = storedRunId;
-  }
-  if (storedArtifactId) {
-    state.selectedArtifactId = storedArtifactId;
-  }
-  if (storedPolling === 'true') {
-    state.pollingPaused = true;
-  }
-  state.taskFilter = storedTaskFilter;
-  state.eventLevelFilter = storedEventLevelFilter;
-  state.approvalFilter = storedApprovalFilter;
-  applyHashState();
-}
-
-function persistUiState() {
-  safeWriteStorage(storageKeys.selectedTaskId, state.selectedTaskId);
-  safeWriteStorage(storageKeys.selectedRunId, state.selectedRunId);
-  safeWriteStorage(storageKeys.selectedArtifactId, state.selectedArtifactId);
-  safeWriteStorage(storageKeys.activeView, state.activeView);
-  safeWriteStorage(storageKeys.pollingPaused, state.pollingPaused ? 'true' : 'false');
-  safeWriteStorage(storageKeys.taskFilter, state.taskFilter);
-  safeWriteStorage(storageKeys.eventLevelFilter, state.eventLevelFilter);
-  safeWriteStorage(storageKeys.approvalFilter, state.approvalFilter);
-  syncHashState();
-}
-
-function applyHashState() {
-  const hash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : '';
-  if (!hash) {
-    return;
-  }
-  const params = new URLSearchParams(hash);
-  const taskId = params.get('task');
-  const runId = params.get('run');
-  const artifactId = params.get('artifact');
-  const view = params.get('view');
-  if (taskId) {
-    state.selectedTaskId = taskId;
-  }
-  if (runId) {
-    state.selectedRunId = runId;
-  }
-  if (artifactId) {
-    state.selectedArtifactId = artifactId;
-  }
-  if (view === 'overview' || view === 'artifacts' || view === 'logs' || view === 'run') {
-    state.activeView = view;
-  }
-}
-
-function syncHashState() {
-  const params = new URLSearchParams();
-  if (state.selectedTaskId) {
-    params.set('task', state.selectedTaskId);
-  }
-  if (state.selectedRunId) {
-    params.set('run', state.selectedRunId);
-  }
-  if (state.selectedArtifactId) {
-    params.set('artifact', state.selectedArtifactId);
-  }
-  if (state.activeView !== 'overview') {
-    params.set('view', state.activeView);
-  }
-  const nextHash = params.toString();
-  const nextUrl = nextHash ? window.location.pathname + '#' + nextHash : window.location.pathname;
-  window.history.replaceState(null, '', nextUrl);
-}
+${dashboardRouteStateScript}
 
 function scheduleRefreshFromStream() {
   if (state.pollingPaused) {
@@ -331,19 +219,19 @@ function getStateTone(status) {
 
 function getStateLabel(status) {
   const labels = {
-    queued: 'Queued',
-    planning: 'Planning',
-    validating: 'Validating',
-    executing: 'Running',
-    awaiting_approval: 'Awaiting approval',
-    verifying: 'Verifying',
-    completed: 'Completed',
-    failed: 'Failed',
-    retryable: 'Needs retry',
-    blocked: 'Blocked',
-    cancelled: 'Cancelled',
-    rolled_back: 'Rolled back',
-    escalated: 'Escalated',
+    queued: 'В очереди',
+    planning: 'Планирование',
+    validating: 'Проверка плана',
+    executing: 'Исполнение',
+    awaiting_approval: 'Ожидает подтверждения',
+    verifying: 'Проверка результата',
+    completed: 'Завершено',
+    failed: 'Ошибка',
+    retryable: 'Доступен повтор',
+    blocked: 'Заблокировано',
+    cancelled: 'Отменено',
+    rolled_back: 'Откат выполнен',
+    escalated: 'Требует оператора',
   };
   return labels[status] || status;
 }
@@ -480,8 +368,8 @@ function renderFilterBar() {
     '<section class="panel stack filter-panel">',
     '<div class="toolbar spread">',
     '<div class="stack gap-xs">',
-    '<div class="eyebrow">View controls</div>',
-    '<h3>Signals over noise</h3>',
+    '<div class="eyebrow">Фильтры</div>',
+    '<h3>Параметры отображения</h3>',
     '</div>',
     '<div class="meta">' + escapeHtml(copy.hiddenNoise) + '</div>',
     '</div>',
@@ -509,10 +397,10 @@ function renderFilterBar() {
     '<div class="field"><label>' + escapeHtml(copy.filterApprovals) + '</label><select data-filter="approval-status">' +
       renderSelectOptions([
         { value: '', label: copy.allApprovals },
-        { value: 'pending', label: 'Pending' },
-        { value: 'approved', label: 'Approved' },
-        { value: 'rejected', label: 'Rejected' },
-        { value: 'consumed', label: 'Consumed' },
+        { value: 'pending', label: 'Ожидает' },
+        { value: 'approved', label: 'Подтверждено' },
+        { value: 'rejected', label: 'Отклонено' },
+        { value: 'consumed', label: 'Использовано' },
       ], state.approvalFilter) +
     '</select></div>',
     '</div>',
@@ -525,17 +413,37 @@ function renderPager(kind, page) {
     return '';
   }
 
-  const previousOffset = Math.max(page.offset - page.limit, 0);
-  const nextOffset = page.offset + page.limit;
-  const canGoBack = page.offset > 0;
-  const canGoForward = nextOffset < page.total;
+  const previousCursor = typeof page.previousCursor === 'string' ? page.previousCursor : '';
+  const nextCursor = typeof page.nextCursor === 'string' ? page.nextCursor : '';
+  const canGoBack = previousCursor.length > 0;
+  const canGoForward = nextCursor.length > 0;
 
   return [
     '<div class="toolbar pager">',
-    '<button type="button" class="button secondary" data-page-kind="' + escapeHtml(kind) + '" data-page-offset="' + escapeHtml(String(previousOffset)) + '"' + (canGoBack ? '' : ' disabled') + '>Previous</button>',
-    '<div class="meta">Showing ' + escapeHtml(String(page.offset + 1)) + '–' + escapeHtml(String(Math.min(page.offset + page.limit, page.total))) + ' of ' + escapeHtml(String(page.total)) + '</div>',
-    '<button type="button" class="button secondary" data-page-kind="' + escapeHtml(kind) + '" data-page-offset="' + escapeHtml(String(nextOffset)) + '"' + (canGoForward ? '' : ' disabled') + '>Next</button>',
+    '<button type="button" class="button secondary" data-page-kind="' + escapeHtml(kind) + '" data-page-cursor="' + escapeHtml(previousCursor) + '"' + (canGoBack ? '' : ' disabled') + '>Назад</button>',
+    '<div class="meta">Показано ' + escapeHtml(String(page.offset + 1)) + '–' + escapeHtml(String(Math.min(page.offset + page.limit, page.total))) + ' из ' + escapeHtml(String(page.total)) + '</div>',
+    '<button type="button" class="button secondary" data-page-kind="' + escapeHtml(kind) + '" data-page-cursor="' + escapeHtml(nextCursor) + '"' + (canGoForward ? '' : ' disabled') + '>Далее</button>',
     '</div>',
+  ].join('');
+}
+
+function renderTaskActions(actions, taskId) {
+  if (!Array.isArray(actions) || actions.length === 0) {
+    return '';
+  }
+
+  return [
+    '<section class="stack">',
+    '<div class="section-heading">' + escapeHtml(copy.operatorActions) + '</div>',
+    '<div class="toolbar">',
+    actions
+      .map((action) => {
+        const toneClass = action.tone === 'danger' ? ' danger' : action.tone === 'warning' ? ' warning' : ' secondary';
+        return '<button type="button" class="button' + toneClass + '" data-task-action="' + escapeHtml(action.action) + '" data-task-action-id="' + escapeHtml(taskId) + '">' + escapeHtml(action.label) + '</button>';
+      })
+      .join(''),
+    '</div>',
+    '</section>',
   ].join('');
 }
 
@@ -649,25 +557,9 @@ function collectRunChangedFiles(run) {
   });
 }
 
-function summarizeRun(run) {
-  const evaluation = Array.isArray(run.evaluations) && run.evaluations.length > 0 ? run.evaluations[run.evaluations.length - 1] : null;
-  const changedFiles = collectRunChangedFiles(run);
-  const filteredEvents = Array.isArray(run.events) ? run.events.filter(matchesEventLevel) : [];
-  const latestEvent = filteredEvents.length > 0 ? filteredEvents[filteredEvents.length - 1] : null;
-  const completedSteps = Array.isArray(run.steps) ? run.steps.filter((step) => step.status === 'completed').length : 0;
-  const failedSteps = Array.isArray(run.steps) ? run.steps.filter((step) => step.status === 'failed').length : 0;
-
-  return {
-    changedFiles,
-    latestEvent,
-    completedSteps,
-    failedSteps,
-    score: evaluation ? evaluation.score : null,
-  };
-}
-
-function renderRunSummaryCard(run) {
-  const summary = summarizeRun(run);
+function renderRunSummaryCard(runEntry) {
+  const run = runEntry.run;
+  const summary = runEntry.summary;
   return [
     '<button type="button" class="card stack run-summary-card" data-run-id="' + escapeHtml(run.id) + '">',
     '<div class="toolbar spread">',
@@ -683,42 +575,43 @@ function renderRunSummaryCard(run) {
       { label: 'changed files', value: String(summary.changedFiles.length) },
       { label: 'score', value: summary.score === null ? 'n/a' : String(summary.score) },
     ]),
-    summary.latestEvent
-      ? '<div class="meta">Последний сигнал: ' + escapeHtml(describeEvent(summary.latestEvent).title) + '</div>'
+    summary.latestEventTitle
+      ? '<div class="meta">Последний сигнал: ' + escapeHtml(summary.latestEventTitle) + '</div>'
       : '<div class="meta">События ещё не записаны.</div>',
     '</button>',
   ].join('');
 }
 
-function renderTaskHeader(timeline) {
-  const latestRun = Array.isArray(timeline.runs) && timeline.runs.length > 0 ? timeline.runs[0] : null;
-  const latestRunSummary = latestRun ? summarizeRun(latestRun) : null;
+function renderTaskHeader(taskView) {
+  const latestRun = Array.isArray(taskView.runs) && taskView.runs.length > 0 ? taskView.runs[0] : null;
+  const summary = taskView.summary && typeof taskView.summary === 'object' ? taskView.summary : null;
 
   return [
     '<section class="panel stack task-header-panel">',
     '<div class="toolbar spread">',
     '<div class="stack gap-xs">',
     '<div class="eyebrow">' + escapeHtml(copy.selectedTask) + '</div>',
-    '<h2>' + escapeHtml(timeline.task.goal) + '</h2>',
-    '<div class="meta mono">' + escapeHtml(timeline.task.id) + '</div>',
+    '<h2>' + escapeHtml(taskView.task.goal) + '</h2>',
+    '<div class="meta mono">' + escapeHtml(taskView.task.id) + '</div>',
     '</div>',
-    renderPill(getStateLabel(timeline.task.state), getStateTone(timeline.task.state)),
+    renderPill(getStateLabel(taskView.task.state), getStateTone(taskView.task.state)),
     '</div>',
     '<div class="summary-text">' +
       escapeHtml(
-        latestRunSummary
-          ? 'Последний run: ' + getStateLabel(latestRun.status) + ', ' + String(latestRunSummary.completedSteps) + ' подтверждённых шагов и ' + String(latestRunSummary.changedFiles.length) + ' изменённых файлов.'
+        summary && summary.latestRunId
+          ? 'Последний run: ' + getStateLabel(summary.latestRunState || 'queued') + ', ' + String(summary.latestRunCompletedSteps) + ' подтверждённых шагов и ' + String(summary.latestRunChangedFiles) + ' изменённых файлов.'
           : 'Задача создана, но run ещё не стартовал.',
       ) +
     '</div>',
     createKeyFacts([
-      { label: 'target', value: timeline.task.target_id },
-      { label: 'updated', value: formatRelativeTime(timeline.task.updated_at) },
-      { label: 'runs', value: String(timeline.page.total) },
-      { label: 'approvals', value: String(Array.isArray(timeline.approvals) ? timeline.approvals.length : 0) },
+      { label: 'target', value: taskView.task.target_id },
+      { label: 'updated', value: formatRelativeTime(summary ? summary.updatedAt : taskView.task.updated_at) },
+      { label: 'runs', value: String(taskView.runsPage.total) },
+      { label: 'approvals', value: String(Array.isArray(taskView.approvals) ? taskView.approvals.length : 0) },
     ]),
+    renderTaskActions(taskView.actions, taskView.task.id),
     latestRun
-      ? '<section class="stack"><div class="section-heading">Run summaries</div><div class="grid two">' + timeline.runs.map(renderRunSummaryCard).join('') + '</div></section>'
+      ? '<section class="stack"><div class="section-heading">Сводка запусков</div><div class="grid two">' + taskView.runs.map(renderRunSummaryCard).join('') + '</div></section>'
       : '',
     '</section>',
   ].join('');
@@ -735,9 +628,9 @@ function describeTaskState(tasks) {
   }
   if (tasks.length === 0) {
     return {
-      label: 'Idle',
+      label: copy.stateIdle,
       tone: '',
-      detail: 'Нет активных задач',
+      detail: 'Активные задачи отсутствуют.',
     };
   }
   return {
@@ -912,7 +805,7 @@ function renderEvaluation(evaluation) {
     '</div>',
     issues.length > 0
       ? '<div><div class="summary-title">Issues</div>' + createBulletList(issues) + '</div>'
-      : '<div class="meta">Проблем evaluator не нашёл.</div>',
+      : '<div class="meta">Замечания evaluator отсутствуют.</div>',
     suggestions.length > 0
       ? '<div><div class="summary-title">Suggestions</div>' + createBulletList(suggestions) + '</div>'
       : '',
@@ -983,7 +876,7 @@ function renderApprovals(approvals) {
 
 function renderTargets(targets) {
   if (targets.length === 0) {
-    return '<div class="empty">Targets не настроены.</div>';
+    return '<div class="empty">Контуры не настроены.</div>';
   }
   return targets
     .map((target) => {
@@ -1025,7 +918,7 @@ function renderSchedules(schedules) {
 
 function renderMaintenance(maintenance) {
   if (!maintenance || typeof maintenance !== 'object') {
-    return '<div class="empty">Maintenance summary недоступен.</div>';
+    return '<div class="empty">Сводка обслуживания недоступна.</div>';
   }
   const status = maintenance.status && typeof maintenance.status === 'object' ? maintenance.status : {};
   const totals = maintenance.totals && typeof maintenance.totals === 'object' ? maintenance.totals : {};
@@ -1064,14 +957,14 @@ function renderMaintenance(maintenance) {
 
 function renderMetrics(metrics) {
   if (!metrics || typeof metrics !== 'object') {
-    return '<div class="empty">Metrics недоступны.</div>';
+    return '<div class="empty">Метрики недоступны.</div>';
   }
   const failureTypes = metrics.failure_types && typeof metrics.failure_types === 'object' ? metrics.failure_types : {};
   const failureItems = Object.entries(failureTypes).map((entry) => entry[0] + ': ' + String(entry[1]));
   return [
     '<section class="panel stack">',
     '<div class="toolbar spread">',
-    '<h2>Metrics</h2>',
+    '<h2>Метрики</h2>',
     renderPill(metrics.success_rate >= 0.8 ? 'healthy' : 'watch', metrics.success_rate >= 0.8 ? 'success' : 'warning'),
     '</div>',
     createKeyFacts([
@@ -1082,297 +975,6 @@ function renderMetrics(metrics) {
     failureItems.length > 0
       ? '<div><div class="summary-title">Failure types</div>' + createBulletList(failureItems) + '</div>'
       : '<div class="meta">Пока нет накопленных failure types.</div>',
-    '</section>',
-  ].join('');
-}
-
-function renderRun(run) {
-  const filteredEvents = run.events.filter(matchesEventLevel);
-  return [
-    '<section class="panel stack">',
-    '<div class="toolbar spread">',
-    '<div class="stack gap-xs">',
-    '<div class="eyebrow">Run ' + String(run.iteration + 1) + '</div>',
-    '<h3 class="mono">' + escapeHtml(run.id) + '</h3>',
-    '<div class="meta">started ' + escapeHtml(formatDateTime(run.started_at)) + '</div>',
-    '</div>',
-    renderPill(getStateLabel(run.status), getStateTone(run.status)),
-    '</div>',
-    filteredEvents.length > 0
-      ? '<div class="stack section-group"><div class="section-heading">Events</div>' + filteredEvents.map(renderEvent).join('') + '</div>'
-      : '<div class="empty">События этого run скрыты текущим фильтром.</div>',
-    run.steps.length > 0
-      ? '<div class="stack section-group"><div class="section-heading">Steps</div>' + run.steps.map(renderStep).join('') + '</div>'
-      : '',
-    run.evaluations.length > 0
-      ? '<div class="stack section-group"><div class="section-heading">Evaluations</div>' + run.evaluations.map(renderEvaluation).join('') + '</div>'
-      : '',
-    '</section>',
-  ].join('');
-}
-
-function renderOverview(timeline, maintenance, metrics) {
-  const overviewBody = !timeline || !timeline.task
-    ? '<section class="panel stack"><div class="empty">' + escapeHtml(copy.noTaskSelected) + '</div></section>'
-    : [
-        renderTaskHeader(timeline),
-        Array.isArray(timeline.approvals) && timeline.approvals.length > 0
-          ? '<section class="stack"><div class="section-heading">Task approvals</div>' + renderApprovals(timeline.approvals) + '</section>'
-          : '',
-        Array.isArray(timeline.runs) && timeline.runs.length > 0
-          ? '<section class="stack">' + renderPager('runs', timeline.page) + timeline.runs.map(renderRun).join('') + '</section>'
-          : '<div class="empty">Запусков ещё нет.</div>',
-        '</section>',
-      ].join('');
-
-  return [
-    '<section class="split">',
-    '<section class="panel stack"><div class="toolbar spread"><h2>' + escapeHtml(copy.tasks) + '</h2>' + renderPill('live queue', '') + '</div><div id="tasksList" class="list"></div></section>',
-    '<section class="stack">' + overviewBody + '</section>',
-    '</section>',
-    renderFilterBar(),
-    '<section class="grid two">',
-    renderMaintenance(maintenance),
-    renderMetrics(metrics),
-    '</section>',
-  ].join('');
-}
-
-function summarizeArtifactPayload(artifact, content) {
-  if (artifact.summary) {
-    return {
-      title: artifact.summary.title,
-      summary: artifact.summary.summary,
-      facts: Array.isArray(artifact.summary.facts) ? artifact.summary.facts : [],
-      bullets: Array.isArray(artifact.summary.changedFiles) ? artifact.summary.changedFiles : [],
-      patch: artifact.summary.patch,
-      raw: artifact.summary.rawJson ? artifact.summary.rawJson : artifact.summary.rawText,
-    };
-  }
-
-  const parsed = parseJson(content);
-  if (!parsed || typeof parsed !== 'object') {
-    return {
-      title: artifact.type,
-      summary: 'Текстовый артефакт без структурированного JSON.',
-      facts: [
-        { label: 'path', value: artifact.path },
-        { label: 'created', value: formatDateTime(artifact.created_at) },
-      ],
-      bullets: [],
-      patch: null,
-      raw: content,
-    };
-  }
-
-  if (artifact.type === 'request') {
-    return {
-      title: 'Запрос к инструменту',
-      summary: parsed.step && parsed.step.tool ? 'Подготовка шага ' + parsed.step.tool : 'Исходный request для bounded tool.',
-      facts: [
-        { label: 'tool', value: parsed.step && typeof parsed.step.tool === 'string' ? parsed.step.tool : artifact.tool },
-        { label: 'rationale', value: parsed.step && typeof parsed.step.rationale === 'string' ? parsed.step.rationale : '' },
-      ],
-      bullets: [],
-      patch: null,
-      raw: parsed,
-    };
-  }
-
-  if (artifact.type === 'result') {
-    const summary = summarizeToolOutput(parsed);
-    return {
-      title: 'Результат инструмента',
-      summary: summary.summary,
-      facts: summary.facts,
-      bullets: summary.changedFiles,
-      patch: null,
-      raw: summary.raw,
-    };
-  }
-
-  if (artifact.type === 'verification') {
-    return {
-      title: 'Проверка результата',
-      summary: parsed.verified === true ? 'Verifier подтвердил результат.' : 'Verifier не подтвердил результат.',
-      facts: [
-        { label: 'verified', value: typeof parsed.verified === 'boolean' ? String(parsed.verified) : '' },
-        { label: 'evidence', value: typeof parsed.evidence === 'string' ? parsed.evidence : '' },
-      ],
-      bullets: [],
-      patch: null,
-      raw: parsed,
-    };
-  }
-
-  if (artifact.type === 'report') {
-    const changedFiles = normalizeChangedFiles(parsed.changedFiles);
-    return {
-      title: 'Итоговый report',
-      summary: parsed.success === true ? 'Шаг успешно завершился.' : 'Шаг завершился без успеха.',
-      facts: [
-        { label: 'success', value: typeof parsed.success === 'boolean' ? String(parsed.success) : '' },
-        { label: 'changed files', value: changedFiles.length > 0 ? String(changedFiles.length) : '0' },
-      ],
-      bullets: changedFiles,
-      patch: null,
-      raw: parsed,
-    };
-  }
-
-  return {
-    title: artifact.type,
-    summary: 'Технический артефакт.',
-    facts: [
-      { label: 'path', value: artifact.path },
-      { label: 'created', value: formatDateTime(artifact.created_at) },
-    ],
-    bullets: [],
-    patch: null,
-    raw: parsed,
-  };
-}
-
-function renderPatchPreview(patch) {
-  if (!patch) {
-    return '';
-  }
-  return [
-    '<section class="stack">',
-    '<div class="section-heading">Patch preview</div>',
-    createKeyFacts([
-      { label: 'files', value: String(patch.fileCount) },
-      { label: 'hunks', value: String(patch.hunkCount) },
-      { label: 'additions', value: String(patch.additions) },
-      { label: 'deletions', value: String(patch.deletions) },
-    ]),
-    patch.files.length > 0
-      ? '<div class="list">' + patch.files.map((file) => [
-          '<div class="card card-soft stack">',
-          '<strong>' + escapeHtml(file.path) + '</strong>',
-          '<div class="meta">+' + escapeHtml(String(file.additions)) + ' / -' + escapeHtml(String(file.deletions)) + '</div>',
-          '</div>',
-        ].join('')).join('') + '</div>'
-      : '',
-    '</section>',
-  ].join('');
-}
-
-function renderArtifacts(artifactBrowser, artifactContent) {
-  const hasRuns = artifactBrowser && Array.isArray(artifactBrowser.runs) && artifactBrowser.runs.length > 0;
-  const artifactList = !hasRuns
-    ? '<div class="empty">' + escapeHtml(copy.noArtifacts) + '</div>'
-    : artifactBrowser.runs
-        .map((runGroup) => [
-          '<section class="artifact-group">',
-          '<div class="group-heading">Run ' + escapeHtml(runGroup.runId) + '</div>',
-          runGroup.steps
-            .map((stepGroup) => [
-              '<div class="artifact-step-group">',
-              '<div class="meta">Step ' + String(stepGroup.stepIndex + 1) + ' · ' + escapeHtml(stepGroup.tool) + '</div>',
-              '<div class="list">',
-              stepGroup.artifacts
-                .map((artifact) => {
-                  const selected = artifact.id === state.selectedArtifactId ? ' selected' : '';
-                  return [
-                    '<button type="button" class="card artifact-card' + selected + '" data-artifact-id="' + escapeHtml(artifact.id) + '">',
-                    '<div class="card-title">',
-                    '<div class="stack gap-xs">',
-                    '<strong>' + escapeHtml(artifact.summary.title) + '</strong>',
-                    '<div class="meta mono">' + escapeHtml(artifact.id) + '</div>',
-                    '</div>',
-                    renderPill(artifact.tool, ''),
-                    '</div>',
-                    '<div class="summary-text">' + escapeHtml(artifact.summary.summary) + '</div>',
-                    '<div class="meta">' + escapeHtml(formatRelativeTime(artifact.created_at)) + '</div>',
-                    '</button>',
-                  ].join('');
-                })
-                .join(''),
-              '</div>',
-              '</div>',
-            ].join(''))
-            .join(''),
-          '</section>',
-        ].join(''))
-        .join('');
-
-  const artifactPreview = artifactContent
-    ? (function () {
-        const summary = summarizeArtifactPayload(artifactContent.artifact, artifactContent.content);
-        return [
-          '<section class="panel stack">',
-          '<div class="toolbar spread">',
-          '<div class="stack gap-xs">',
-          '<div class="eyebrow">Artifact preview</div>',
-          '<h2>' + escapeHtml(summary.title) + '</h2>',
-          '<div class="meta mono">' + escapeHtml(artifactContent.artifact.path) + '</div>',
-          '</div>',
-          renderPill(artifactContent.artifact.type, ''),
-          '</div>',
-          '<div class="summary-text">' + escapeHtml(summary.summary) + '</div>',
-          createKeyFacts(summary.facts),
-          summary.bullets.length > 0
-            ? '<div><div class="section-heading">Changed files</div>' + createBulletList(summary.bullets) + '</div>'
-            : '',
-          renderPatchPreview(summary.patch),
-          createRawDetails(copy.rawDetails + ': artifact content', summary.raw),
-          '</section>',
-        ].join('');
-      })()
-    : '<section class="panel stack"><div class="empty">Выбери артефакт для просмотра.</div></section>';
-
-  return [
-    '<section class="split">',
-    '<section class="panel stack"><div class="toolbar spread"><h2>Artifacts</h2>' + renderPill('task scope', '') + '</div>' + renderPager('artifacts', artifactBrowser ? artifactBrowser.page : null) + '<div class="list">' + artifactList + '</div></section>',
-    '<section class="stack">' + artifactPreview + '</section>',
-    '</section>',
-  ].join('');
-}
-
-function renderRunPage(runView) {
-  if (!runView || !runView.run) {
-    return '<section class="panel stack"><div class="empty">Выбери run для просмотра.</div></section>';
-  }
-
-  return [
-    '<section class="stack">',
-    '<section class="panel stack task-header-panel">',
-    '<div class="toolbar spread">',
-    '<div class="stack gap-xs">',
-    '<div class="eyebrow">Run permalink</div>',
-    '<h2>' + escapeHtml(runView.task.goal) + '</h2>',
-    '<div class="meta mono">' + escapeHtml(runView.run.id) + '</div>',
-    '</div>',
-    renderPill(getStateLabel(runView.run.status), getStateTone(runView.run.status)),
-    '</div>',
-    '<div class="summary-text">' +
-      escapeHtml(
-        runView.summary.latestEventTitle
-          ? 'Последний сигнал: ' + runView.summary.latestEventTitle
-          : 'Run открыт в permalink-режиме.',
-      ) +
-    '</div>',
-    createKeyFacts([
-      { label: 'task', value: runView.task.id },
-      { label: 'completed steps', value: String(runView.summary.completedSteps) },
-      { label: 'failed steps', value: String(runView.summary.failedSteps) },
-      { label: 'changed files', value: String(runView.summary.changedFiles.length) },
-      { label: 'score', value: runView.summary.score === null ? 'n/a' : String(runView.summary.score) },
-    ]),
-    runView.summary.changedFiles.length > 0
-      ? '<div><div class="section-heading">Changed files</div>' + createBulletList(runView.summary.changedFiles) + '</div>'
-      : '',
-    '</section>',
-    renderRun({
-      id: runView.run.id,
-      status: runView.run.status,
-      iteration: runView.run.iteration,
-      started_at: runView.run.started_at,
-      events: runView.events,
-      steps: runView.steps,
-      evaluations: runView.evaluations,
-    }),
     '</section>',
   ].join('');
 }
@@ -1431,38 +1033,8 @@ function parseLogEntries(logs) {
     });
 }
 
-function renderLogs(logs) {
-  if (!logs) {
-    return '<section class="panel stack"><div class="empty">' + escapeHtml(copy.noLogs) + '</div></section>';
-  }
-  const entries = parseLogEntries(logs);
-  return [
-    '<section class="panel stack">',
-    '<div class="toolbar spread">',
-    '<div class="stack gap-xs">',
-    '<div class="eyebrow">Runtime logs</div>',
-    '<h2>Operational feed</h2>',
-    '<div class="meta mono">' + escapeHtml(logs.path) + '</div>',
-    '</div>',
-    renderPill('tail ' + String(logs.tail), ''),
-    '</div>',
-    entries.length === 0
-      ? '<div class="empty">' + escapeHtml(copy.noLogs) + '</div>'
-      : '<div class="stack">' + entries.map((entry) => [
-          '<article class="event-card ' + escapeHtml(entry.level) + '">',
-          '<div class="toolbar spread">',
-          '<div class="stack gap-xs">',
-          '<strong>' + escapeHtml(entry.title) + '</strong>',
-          entry.summary ? '<div class="meta">' + escapeHtml(entry.summary) + '</div>' : '',
-          '</div>',
-          entry.time ? '<span class="meta mono">' + escapeHtml(entry.time) + '</span>' : '',
-          '</div>',
-          entry.details ? createRawDetails(copy.rawDetails + ': log entry', entry.details) : '',
-          '</article>',
-        ].join('')).join('') + '</div>',
-    '</section>',
-  ].join('');
-}
+${dashboardArtifactViewsScript}
+${dashboardTaskViewsScript}
 
 function renderShell() {
   if (state.shellReady) {
@@ -1500,25 +1072,26 @@ function renderShell() {
     '<div class="toolbar spread">',
     '<div class="stack hero-copy">',
     '<div class="eyebrow">' + escapeHtml(copy.runtime) + '</div>',
-    '<h2>Live orchestration surface</h2>',
+    '<h2>Управление runtime</h2>',
     '<div id="statusDetail" class="meta">' + escapeHtml(copy.dashboardReady) + '</div>',
     '</div>',
     '<div class="toolbar">',
+    '<button id="compactModeButton" type="button" class="button secondary"></button>',
     '<button id="pollingToggleButton" type="button" class="button ghost"></button>',
     '<span id="runtimeHealth"></span>',
     '</div>',
     '</div>',
     '<div class="status-strip">',
-    '<div class="status-card"><div class="meta">current flow</div><div id="statusCurrentTask" class="status-value"></div></div>',
-    '<div class="status-card"><div class="meta">selected task</div><div id="statusSelectedTask" class="status-value"></div></div>',
-    '<div class="status-card"><div class="meta">last refresh</div><div id="statusLastUpdated" class="status-value"></div></div>',
-    '<div class="status-card"><div class="meta">polling</div><div id="statusPolling" class="status-value"></div></div>',
+    '<div class="status-card"><div class="meta">текущее состояние</div><div id="statusCurrentTask" class="status-value"></div></div>',
+    '<div class="status-card"><div class="meta">выбранная задача</div><div id="statusSelectedTask" class="status-value"></div></div>',
+    '<div class="status-card"><div class="meta">последнее обновление</div><div id="statusLastUpdated" class="status-value"></div></div>',
+    '<div class="status-card"><div class="meta">обновление</div><div id="statusPolling" class="status-value"></div></div>',
     '</div>',
     '<div class="kpi-grid">',
     '<div class="kpi"><div class="meta">mode</div><div id="kpiMode" class="kpi-value"></div></div>',
     '<div class="kpi"><div class="meta">autonomy</div><div id="kpiAutonomy" class="kpi-value"></div></div>',
     '<div class="kpi"><div class="meta">tasks</div><div id="kpiTasks" class="kpi-value"></div></div>',
-    '<div class="kpi"><div class="meta">pending approvals</div><div id="kpiApprovals" class="kpi-value"></div></div>',
+    '<div class="kpi"><div class="meta">ожидающие подтверждения</div><div id="kpiApprovals" class="kpi-value"></div></div>',
     '</div>',
     '<div id="notificationBar"></div>',
     '</section>',
@@ -1572,9 +1145,11 @@ function bindShellEvents() {
         state.selectedTaskId = taskId;
         state.selectedRunId = '';
         state.selectedArtifactId = '';
-        state.runPageOffset = 0;
-        state.artifactPageOffset = 0;
-        persistUiState();
+        state.taskRunCursor = '';
+        state.runEventCursor = '';
+        state.artifactCursor = '';
+        state.activeView = 'overview';
+        persistUiState('push');
         void refreshDashboard({ showLoading: false, force: true });
       }
       return;
@@ -1598,12 +1173,23 @@ function bindShellEvents() {
       return;
     }
 
+    const taskActionNode = event.target.closest('[data-task-action]');
+    if (taskActionNode instanceof HTMLElement) {
+      const action = taskActionNode.getAttribute('data-task-action');
+      const taskId = taskActionNode.getAttribute('data-task-action-id');
+      if (taskId && (action === 'retry' || action === 'replan' || action === 'escalate' || action === 'cancel')) {
+        void runTaskAction(taskId, action);
+      }
+      return;
+    }
+
     const artifactNode = event.target.closest('[data-artifact-id]');
     if (artifactNode instanceof HTMLElement) {
       const artifactId = artifactNode.getAttribute('data-artifact-id');
       if (artifactId && artifactId !== state.selectedArtifactId) {
         state.selectedArtifactId = artifactId;
-        persistUiState();
+        state.activeView = 'artifacts';
+        persistUiState('push');
         void refreshDashboard({ showLoading: false, force: true });
       }
       return;
@@ -1615,7 +1201,7 @@ function bindShellEvents() {
       if (runId) {
         state.selectedRunId = runId;
         state.activeView = 'run';
-        persistUiState();
+        persistUiState('push');
         void refreshDashboard({ showLoading: false, force: true });
       }
       return;
@@ -1624,17 +1210,17 @@ function bindShellEvents() {
     const pagerNode = event.target.closest('[data-page-kind]');
     if (pagerNode instanceof HTMLElement) {
       const pageKind = pagerNode.getAttribute('data-page-kind');
-      const pageOffsetValue = pagerNode.getAttribute('data-page-offset');
-      const pageOffset = pageOffsetValue ? Number(pageOffsetValue) : 0;
-      if (Number.isFinite(pageOffset)) {
-        if (pageKind === 'runs') {
-          state.runPageOffset = pageOffset;
-        }
-        if (pageKind === 'artifacts') {
-          state.artifactPageOffset = pageOffset;
-        }
-        void refreshDashboard({ showLoading: false, force: true });
+      const pageCursor = pagerNode.getAttribute('data-page-cursor') ?? '';
+      if (pageKind === 'runs') {
+        state.taskRunCursor = pageCursor;
       }
+      if (pageKind === 'run-events') {
+        state.runEventCursor = pageCursor;
+      }
+      if (pageKind === 'artifacts') {
+        state.artifactCursor = pageCursor;
+      }
+      void refreshDashboard({ showLoading: false, force: true });
       return;
     }
 
@@ -1643,7 +1229,7 @@ function bindShellEvents() {
       const nextView = tabNode.getAttribute('data-view');
       if (nextView === 'overview' || nextView === 'artifacts' || nextView === 'logs' || nextView === 'run') {
         state.activeView = nextView;
-        persistUiState();
+        persistUiState('push');
         void refreshDashboard({ showLoading: false, force: true });
       }
     }
@@ -1660,11 +1246,11 @@ function bindShellEvents() {
     const filterType = filterNode.getAttribute('data-filter');
       if (filterType === 'task-state') {
         state.taskFilter = filterNode.value;
-        state.runPageOffset = 0;
+        state.taskRunCursor = '';
       }
       if (filterType === 'event-level') {
         state.eventLevelFilter = filterNode.value;
-        state.runPageOffset = 0;
+        state.runEventCursor = '';
       }
       if (filterType === 'approval-status') {
         state.approvalFilter = filterNode.value;
@@ -1689,6 +1275,16 @@ function bindShellEvents() {
       if (!state.pollingPaused) {
         void refreshDashboard({ showLoading: false, force: true });
       }
+    });
+  }
+
+  const compactModeButton = getElement('compactModeButton');
+  if (compactModeButton instanceof HTMLButtonElement) {
+    compactModeButton.addEventListener('click', () => {
+      state.compactMode = !state.compactMode;
+      persistUiState('replace');
+      applyDensityMode();
+      updateCompactModeUi();
     });
   }
 }
@@ -1717,10 +1313,11 @@ async function submitTask(goalInput, targetSelect) {
       state.selectedRunId = '';
       state.activeView = 'overview';
       state.selectedArtifactId = '';
-      state.runPageOffset = 0;
-      state.artifactPageOffset = 0;
+      state.taskRunCursor = '';
+      state.runEventCursor = '';
+      state.artifactCursor = '';
       goalInput.value = '';
-      persistUiState();
+      persistUiState('push');
     }
   } catch (error) {
     state.lastError = error instanceof Error ? error.message : 'Не удалось создать задачу.';
@@ -1745,6 +1342,21 @@ async function runApprovalAction(approvalId, action) {
   }
 }
 
+async function runTaskAction(taskId, action) {
+  state.lastError = '';
+  updateNotification();
+  try {
+    await fetchJson('/tasks/' + encodeURIComponent(taskId) + '/actions/' + action, {
+      method: 'POST',
+    });
+  } catch (error) {
+    state.lastError = error instanceof Error ? error.message : 'Не удалось выполнить действие над задачей.';
+  } finally {
+    updateNotification();
+    await refreshDashboard({ showLoading: false, force: true });
+  }
+}
+
 function updatePollingUi() {
   const pollingToggleButton = document.getElementById('pollingToggleButton');
   if (pollingToggleButton instanceof HTMLButtonElement) {
@@ -1752,6 +1364,17 @@ function updatePollingUi() {
   }
   const streamLabel = state.pollingPaused ? copy.streamPaused : state.streamConnected ? copy.streamConnected : copy.streamConnecting;
   setText('statusPolling', streamLabel);
+}
+
+function applyDensityMode() {
+  document.body.classList.toggle('compact', state.compactMode);
+}
+
+function updateCompactModeUi() {
+  const compactModeButton = document.getElementById('compactModeButton');
+  if (compactModeButton instanceof HTMLButtonElement) {
+    compactModeButton.textContent = state.compactMode ? copy.disableCompact : copy.enableCompact;
+  }
 }
 
 function setBusyState() {
@@ -1825,6 +1448,36 @@ function updateNotification() {
 }
 
 async function loadDashboardData() {
+  let runView = null;
+  let artifactContent = null;
+  let logs = null;
+
+  if (state.activeView === 'run' && state.selectedRunId) {
+    const runQuery = new URLSearchParams({
+      limit: String(pageSize.runs),
+    });
+    if (state.runEventCursor) {
+      runQuery.set('cursor', state.runEventCursor);
+    }
+    if (state.eventLevelFilter) {
+      runQuery.set('level', state.eventLevelFilter);
+    }
+    runView = await fetchJson('/runs/' + encodeURIComponent(state.selectedRunId) + '/view?' + runQuery.toString());
+    if (runView && runView.task && typeof runView.task.id === 'string') {
+      state.selectedTaskId = runView.task.id;
+    }
+  }
+
+  if (state.activeView === 'artifacts' && state.selectedArtifactId) {
+    artifactContent = await fetchJson('/artifacts/' + encodeURIComponent(state.selectedArtifactId) + '/view');
+    if (artifactContent && artifactContent.artifact && typeof artifactContent.artifact.taskId === 'string') {
+      state.selectedTaskId = artifactContent.artifact.taskId;
+    }
+    if (artifactContent && artifactContent.artifact && typeof artifactContent.artifact.runId === 'string') {
+      state.selectedRunId = artifactContent.artifact.runId;
+    }
+  }
+
   const query = new URLSearchParams();
   if (state.selectedTaskId) {
     query.set('taskId', state.selectedTaskId);
@@ -1839,7 +1492,9 @@ async function loadDashboardData() {
     query.set('eventLevel', state.eventLevelFilter);
   }
   query.set('runLimit', String(pageSize.runs));
-  query.set('runOffset', String(state.runPageOffset));
+  if (state.taskRunCursor) {
+    query.set('cursor', state.taskRunCursor);
+  }
   let dashboard = await fetchJson('/dashboard/state' + (query.toString() ? '?' + query.toString() : ''));
   const resolvedSelectedTaskIdFromDashboard =
     dashboard &&
@@ -1886,17 +1541,27 @@ async function loadDashboardData() {
     }
   }
 
+  let taskView = null;
   let artifactBrowser = null;
-  let artifactContent = null;
-  let logs = null;
-  let runView = null;
 
-  if (resolvedSelectedTaskIdFromDashboard && effectiveSelectedTaskId === resolvedSelectedTaskIdFromDashboard) {
+  if (effectiveSelectedTaskId) {
+    const taskQuery = new URLSearchParams({
+      limit: String(pageSize.runs),
+    });
+    if (state.taskRunCursor) {
+      taskQuery.set('cursor', state.taskRunCursor);
+    }
+    taskView = await fetchJson('/tasks/' + encodeURIComponent(effectiveSelectedTaskId) + '/view?' + taskQuery.toString());
+  }
+
+  if (effectiveSelectedTaskId) {
     const artifactQuery = new URLSearchParams({
       limit: String(pageSize.artifacts),
-      offset: String(state.artifactPageOffset),
     });
-    artifactBrowser = await fetchJson('/tasks/' + encodeURIComponent(resolvedSelectedTaskIdFromDashboard) + '/artifacts/browser?' + artifactQuery.toString());
+    if (state.artifactCursor) {
+      artifactQuery.set('cursor', state.artifactCursor);
+    }
+    artifactBrowser = await fetchJson('/tasks/' + encodeURIComponent(effectiveSelectedTaskId) + '/artifacts/browser?' + artifactQuery.toString());
     const artifactItems =
       artifactBrowser && Array.isArray(artifactBrowser.runs)
         ? artifactBrowser.runs.flatMap((runGroup) =>
@@ -1915,16 +1580,8 @@ async function loadDashboardData() {
     state.selectedArtifactId = '';
   }
 
-  if (state.activeView === 'artifacts' && state.selectedArtifactId) {
+  if (state.activeView === 'artifacts' && state.selectedArtifactId && artifactContent === null) {
     artifactContent = await fetchJson('/artifacts/' + encodeURIComponent(state.selectedArtifactId) + '/view');
-  }
-
-  if (state.activeView === 'run' && state.selectedRunId) {
-    const runQuery = new URLSearchParams();
-    if (state.eventLevelFilter) {
-      runQuery.set('eventLevel', state.eventLevelFilter);
-    }
-    runView = await fetchJson('/runs/' + encodeURIComponent(state.selectedRunId) + '/view' + (runQuery.toString() ? '?' + runQuery.toString() : ''));
   }
 
   if (state.activeView === 'logs') {
@@ -1933,6 +1590,7 @@ async function loadDashboardData() {
 
   return {
     dashboard,
+    taskView,
     artifactBrowser,
     artifactContent,
     logs,
@@ -1951,8 +1609,8 @@ function updateViewContent(loadedData) {
     ? dashboard.health
     : { status: 'unknown', mode: 'unknown', autonomy: 'unknown' };
 
-  if (!state.selectedRunId && dashboard.timeline && Array.isArray(dashboard.timeline.runs) && dashboard.timeline.runs[0]) {
-    state.selectedRunId = dashboard.timeline.runs[0].id;
+  if (!state.selectedRunId && loadedData.taskView && Array.isArray(loadedData.taskView.runs) && loadedData.taskView.runs[0]) {
+    state.selectedRunId = loadedData.taskView.runs[0].run.id;
     persistUiState();
   }
 
@@ -1964,6 +1622,7 @@ function updateViewContent(loadedData) {
   updateStatusBar(tasks, health);
   updateTabs();
   updatePollingUi();
+  updateCompactModeUi();
   updateNotification();
 
   setText('kpiMode', String(health.mode));
@@ -1977,7 +1636,7 @@ function updateViewContent(loadedData) {
       ? renderLogs(loadedData.logs)
       : state.activeView === 'run'
         ? renderRunPage(loadedData.runView)
-        : renderOverview(dashboard.timeline, dashboard.maintenance.summary, dashboard.metrics);
+        : renderOverview(loadedData.taskView, dashboard.maintenance.summary, dashboard.metrics);
 
   setHtml('viewContent', content);
 
@@ -2029,9 +1688,9 @@ async function refreshDashboard(options) {
   }
 }
 
-window.addEventListener('hashchange', () => {
-  applyHashState();
-  persistUiState();
+window.addEventListener('popstate', () => {
+  applyRouteState();
+  persistUiState('replace');
   void refreshDashboard({ showLoading: false, force: true });
 });
 
@@ -2040,6 +1699,7 @@ window.addEventListener('beforeunload', () => {
 });
 
 loadPersistedState();
+applyDensityMode();
 
 void refreshDashboard({ showLoading: true, force: true }).then(() => {
   if (!state.pollingPaused) {

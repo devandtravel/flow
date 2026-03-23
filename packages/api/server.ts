@@ -5,14 +5,16 @@ import { URL } from 'node:url';
 import { z } from 'zod';
 import { AgentRuntime, type RuntimeUpdateEvent } from '../core/loop/runtime';
 import { loadConfig, type RuntimeConfig } from '../config';
-import { approvalStatusSchema, capabilityNameSchema, eventLevelSchema, maintenanceOperationSchema, maintenanceTriggerSchema, taskStateSchema } from '../domain';
+import { approvalStatusSchema, artifactTypeSchema, capabilityNameSchema, eventLevelSchema, maintenanceOperationSchema, maintenanceTriggerSchema, runStateSchema, taskStateSchema } from '../domain';
 import { isDomainError } from '../errors';
+import { decodePageCursor } from './pagination';
 import { getDashboardAsset } from './ui';
 import {
   buildArtifactBrowserViewModel,
   buildArtifactPreviewViewModel,
   buildDashboardFiltersViewModel,
   buildDashboardSelectionViewModel,
+  buildTaskViewModel,
   buildRunViewModel,
   filterApprovalsByStatus,
   filterRunEventsByLevel,
@@ -54,6 +56,7 @@ const cleanupBodySchema = z.object({
 const pageQuerySchema = z.object({
   limit: z.number().int().positive().max(100).optional(),
   offset: z.number().int().nonnegative().optional(),
+  cursor: z.string().min(1).optional(),
 });
 
 const logQuerySchema = z.object({
@@ -68,17 +71,39 @@ const dashboardFilterQuerySchema = z.object({
   runOffset: z.number().int().nonnegative().optional(),
 });
 
+const taskRunFilterQuerySchema = z.object({
+  runStatus: runStateSchema.optional(),
+});
+
+const artifactBrowserFilterQuerySchema = z.object({
+  runId: z.string().uuid().optional(),
+  tool: z.string().min(1).optional(),
+  artifactType: artifactTypeSchema.optional(),
+});
+
 function parsePageQuery(requestUrl: URL): z.infer<typeof pageQuerySchema> {
   const limitValue = requestUrl.searchParams.get('limit');
   const offsetValue = requestUrl.searchParams.get('offset');
-  return pageQuerySchema.parse({
+  const cursorValue = requestUrl.searchParams.get('cursor');
+  const parsed = pageQuerySchema.parse({
     limit: limitValue ? Number(limitValue) : undefined,
     offset: offsetValue ? Number(offsetValue) : undefined,
+    cursor: cursorValue ?? undefined,
   });
+  if (!parsed.cursor) {
+    return parsed;
+  }
+
+  const decodedCursor = decodePageCursor(parsed.cursor);
+  return {
+    limit: parsed.limit ?? decodedCursor.limit,
+    offset: parsed.offset ?? decodedCursor.offset,
+    cursor: parsed.cursor,
+  };
 }
 
 function parseRunEventFilter(requestUrl: URL): { level?: z.infer<typeof eventLevelSchema> } {
-  const levelValue = requestUrl.searchParams.get('level');
+  const levelValue = requestUrl.searchParams.get('level') ?? requestUrl.searchParams.get('eventLevel');
   return {
     level: levelValue ? eventLevelSchema.parse(levelValue) : undefined,
   };
@@ -101,6 +126,23 @@ function parseDashboardFilterQuery(requestUrl: URL): z.infer<typeof dashboardFil
     eventLevel: eventLevelValue ? eventLevelSchema.parse(eventLevelValue) : undefined,
     runLimit: requestUrl.searchParams.get('runLimit') ? Number(requestUrl.searchParams.get('runLimit')) : undefined,
     runOffset: requestUrl.searchParams.get('runOffset') ? Number(requestUrl.searchParams.get('runOffset')) : undefined,
+  });
+}
+
+function parseTaskRunFilterQuery(requestUrl: URL): z.infer<typeof taskRunFilterQuerySchema> {
+  const runStatusValue = requestUrl.searchParams.get('runStatus');
+  return taskRunFilterQuerySchema.parse({
+    runStatus: runStatusValue ? runStateSchema.parse(runStatusValue) : undefined,
+  });
+}
+
+function parseArtifactBrowserFilterQuery(requestUrl: URL): z.infer<typeof artifactBrowserFilterQuerySchema> {
+  return artifactBrowserFilterQuerySchema.parse({
+    runId: requestUrl.searchParams.get('runId') ?? undefined,
+    tool: requestUrl.searchParams.get('tool') ?? undefined,
+    artifactType: requestUrl.searchParams.get('artifactType')
+      ? artifactTypeSchema.parse(requestUrl.searchParams.get('artifactType'))
+      : undefined,
   });
 }
 
@@ -302,14 +344,36 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
 
       if (request.method === 'GET' && requestUrl.pathname.startsWith('/tasks/')) {
         const taskId = requestUrl.pathname.split('/')[2];
-        if (requestUrl.pathname.endsWith('/artifacts/browser')) {
+        if (requestUrl.pathname.endsWith('/view')) {
           const page = parsePageQuery(requestUrl);
+          const filter = parseTaskRunFilterQuery(requestUrl);
           sendJson(
             response,
             200,
-            buildArtifactBrowserViewModel(taskId, runtime.getTaskArtifacts(taskId), {
-              limit: page.limit ?? 12,
-              offset: page.offset ?? 0,
+            buildTaskViewModel({
+              ...runtime.getTaskView(taskId, page, {
+                status: filter.runStatus,
+              }),
+              actions: runtime.listTaskOperatorActions(taskId),
+            }),
+          );
+          return;
+        }
+        if (requestUrl.pathname.endsWith('/artifacts/browser')) {
+          const page = parsePageQuery(requestUrl);
+          const filter = parseArtifactBrowserFilterQuery(requestUrl);
+          const artifactPage = runtime.getTaskArtifactPage(taskId, page, {
+            runId: filter.runId,
+            tool: filter.tool,
+            type: filter.artifactType,
+          });
+          sendJson(
+            response,
+            200,
+            buildArtifactBrowserViewModel({
+              taskId,
+              artifacts: artifactPage.artifacts,
+              page: artifactPage.page,
             }),
           );
           return;
@@ -405,6 +469,26 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
         return;
       }
 
+      if (request.method === 'POST' && requestUrl.pathname.startsWith('/tasks/')) {
+        const taskId = requestUrl.pathname.split('/')[2];
+        if (requestUrl.pathname.endsWith('/actions/retry')) {
+          sendJson(response, 200, runtime.applyTaskOperatorAction(taskId, 'retry'));
+          return;
+        }
+        if (requestUrl.pathname.endsWith('/actions/replan')) {
+          sendJson(response, 200, runtime.applyTaskOperatorAction(taskId, 'replan'));
+          return;
+        }
+        if (requestUrl.pathname.endsWith('/actions/escalate')) {
+          sendJson(response, 200, runtime.applyTaskOperatorAction(taskId, 'escalate'));
+          return;
+        }
+        if (requestUrl.pathname.endsWith('/actions/cancel')) {
+          sendJson(response, 200, runtime.applyTaskOperatorAction(taskId, 'cancel'));
+          return;
+        }
+      }
+
       if (request.method === 'POST' && requestUrl.pathname === '/maintenance/cleanup') {
         const body = cleanupBodySchema.parse(await readJsonBody(request));
         sendJson(response, 200, runtime.cleanupState({ ...body, trigger: 'api_manual' }));
@@ -434,22 +518,20 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
       if (request.method === 'GET' && requestUrl.pathname.startsWith('/runs/')) {
         const runId = requestUrl.pathname.split('/')[2];
         if (requestUrl.pathname.endsWith('/view')) {
-          const filters = parseDashboardFilterQuery(requestUrl);
-          const runPayload = runtime.getRun(runId);
-          const task = runtime.inspectTask(runPayload.run.task_id).task;
-          if (!task) {
-            sendJson(response, 404, { error: 'Task not found for run' });
-            return;
-          }
+          const page = parsePageQuery(requestUrl);
+          const filter = parseRunEventFilter(requestUrl);
+          const runPayload = runtime.getRunView(runId, page, filter);
           sendJson(
             response,
             200,
             buildRunViewModel(
-              task,
+              runPayload.task,
               runPayload.run,
               runPayload.steps,
-              filterRunEventsByLevel(runPayload.events, filters.eventLevel),
+              runPayload.events,
               runPayload.evaluations,
+              runPayload.eventsPage,
+              runtime.listTaskOperatorActions(runPayload.task.id),
             ),
           );
           return;

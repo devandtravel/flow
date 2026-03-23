@@ -25,13 +25,13 @@ export interface LlmProvider {
 }
 
 export function extractJsonObjectFromStdout(stdout: string): string | undefined {
-  const lines = stdout
+  const lineCandidates = stdout
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
 
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const candidate = lines[index];
+  for (let index = lineCandidates.length - 1; index >= 0; index -= 1) {
+    const candidate = lineCandidates[index];
     try {
       const parsed = JSON.parse(candidate);
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -42,7 +42,91 @@ export function extractJsonObjectFromStdout(stdout: string): string | undefined 
     }
   }
 
+  const blockCandidate = extractLastJsonObjectCandidate(stdout);
+  if (!blockCandidate) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(blockCandidate);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return blockCandidate;
+    }
+  } catch {
+    return undefined;
+  }
+
   return undefined;
+}
+
+function extractLastJsonObjectCandidate(text: string): string | undefined {
+  for (let start = text.lastIndexOf('{'); start >= 0; start = text.lastIndexOf('{', start - 1)) {
+    const candidate = findJsonObjectAt(text, start);
+    if (candidate) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+function findJsonObjectAt(text: string, startIndex: number): string | undefined {
+  let depth = 0;
+  let inString = false;
+  let isEscaped = false;
+
+  for (let index = startIndex; index < text.length; index += 1) {
+    const character = text[index];
+
+    if (inString) {
+      if (isEscaped) {
+        isEscaped = false;
+        continue;
+      }
+
+      if (character === '\\') {
+        isEscaped = true;
+        continue;
+      }
+
+      if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (character === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (character === '{') {
+      depth += 1;
+      continue;
+    }
+
+    if (character !== '}') {
+      continue;
+    }
+
+    depth -= 1;
+    if (depth === 0) {
+      return text.slice(startIndex, index + 1).trim();
+    }
+  }
+
+  return undefined;
+}
+
+function getStructuredOutputCandidate(
+  outputPath: string,
+  execution: { stdout: string; stderr: string },
+): string {
+  if (existsSync(outputPath)) {
+    return readFileSync(outputPath, 'utf8');
+  }
+
+  return extractJsonObjectFromStdout(execution.stdout) ?? extractJsonObjectFromStdout(execution.stderr) ?? '';
 }
 
 function createHeuristicPlan(goal: string): TaskPlan {
@@ -163,56 +247,91 @@ export class CodexProvider implements LlmProvider {
   constructor(private readonly config: RuntimeConfig['llm']) {}
 
   async complete<TOutput>(request: LlmRequest<TOutput>): Promise<TOutput> {
-    const outputDirectory = mkdtempSync(path.join(os.tmpdir(), 'flow-codex-'));
-    const outputPath = path.join(outputDirectory, 'response.json');
-    const schemaPath = path.join(outputDirectory, 'schema.json');
-    writeFileSync(schemaPath, JSON.stringify(createJsonSchema(request.contract), null, 2));
-    const args = [
-      'exec',
-      '--skip-git-repo-check',
-      '--sandbox',
-      'read-only',
-      '--output-schema',
-      schemaPath,
-      '--output-last-message',
-      outputPath,
-      '--model',
-      this.config.model,
-      request.prompt,
-    ];
+    const maxAttempts = Math.max(this.config.retry_count + 1, 1);
+    let lastError: InvalidOperationError | undefined;
 
-    const execution = spawnSync(this.config.executable, args, {
-      encoding: 'utf8',
-      timeout: this.config.timeout_ms,
-    });
-
-    if (execution.status !== 0) {
-      throw new InvalidOperationError(execution.stderr || execution.stdout || 'Codex execution failed.', {
-        executable: this.config.executable,
-        model: this.config.model,
-        status: execution.status,
-        stdout: execution.stdout,
-        stderr: execution.stderr,
-      });
-    }
-
-    const raw =
-      existsSync(outputPath)
-        ? readFileSync(outputPath, 'utf8')
-        : extractJsonObjectFromStdout(execution.stdout) ?? '';
-
-    if (raw.length === 0) {
-      throw new InvalidOperationError('Codex completed without producing structured output.', {
-        executable: this.config.executable,
-        model: this.config.model,
-        stdout: execution.stdout,
-        stderr: execution.stderr,
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const outputDirectory = mkdtempSync(path.join(os.tmpdir(), 'flow-codex-'));
+      const outputPath = path.join(outputDirectory, 'response.json');
+      const schemaPath = path.join(outputDirectory, 'schema.json');
+      writeFileSync(schemaPath, JSON.stringify(createJsonSchema(request.contract), null, 2));
+      const args = [
+        'exec',
+        '--skip-git-repo-check',
+        '--sandbox',
+        'read-only',
+        '--output-schema',
+        schemaPath,
+        '--output-last-message',
         outputPath,
+        '--model',
+        this.config.model,
+        request.prompt,
+      ];
+
+      const execution = spawnSync(this.config.executable, args, {
+        encoding: 'utf8',
+        timeout: this.config.timeout_ms,
       });
+
+      if (execution.status !== 0) {
+        lastError = new InvalidOperationError(execution.stderr || execution.stdout || 'Codex execution failed.', {
+          executable: this.config.executable,
+          model: this.config.model,
+          status: execution.status,
+          stdout: execution.stdout,
+          stderr: execution.stderr,
+          attempt,
+          maxAttempts,
+        });
+        if (attempt < maxAttempts) {
+          continue;
+        }
+        throw lastError;
+      }
+
+      const raw = getStructuredOutputCandidate(outputPath, execution);
+      if (raw.length === 0) {
+        lastError = new InvalidOperationError('Codex completed without producing structured output.', {
+          executable: this.config.executable,
+          model: this.config.model,
+          stdout: execution.stdout,
+          stderr: execution.stderr,
+          outputPath,
+          attempt,
+          maxAttempts,
+        });
+        if (attempt < maxAttempts) {
+          continue;
+        }
+        throw lastError;
+      }
+
+      try {
+        const parsed = JSON.parse(raw);
+        return request.schema.parse(parsed);
+      } catch (error) {
+        lastError = new InvalidOperationError(
+          error instanceof Error ? error.message : 'Codex returned invalid structured output.',
+          {
+            executable: this.config.executable,
+            model: this.config.model,
+            stdout: execution.stdout,
+            stderr: execution.stderr,
+            outputPath,
+            raw,
+            attempt,
+            maxAttempts,
+          },
+        );
+        if (attempt < maxAttempts) {
+          continue;
+        }
+        throw lastError;
+      }
     }
 
-    const parsed = JSON.parse(raw);
-    return request.schema.parse(parsed);
+    throw lastError ?? new InvalidOperationError('Codex provider failed without an explicit error.');
   }
 }
 

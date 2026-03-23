@@ -62,6 +62,13 @@ export interface MaintenanceEventFilter {
   trigger?: MaintenanceEventRecord['trigger'];
 }
 
+export interface TaskArtifactPageRow extends ArtifactRecord {
+  task_id: string;
+  run_id: string;
+  step_index: number;
+  tool: string;
+}
+
 const rawRowArraySchema = z.array(z.unknown());
 
 function stringifyJson(value: JsonObject): string {
@@ -99,6 +106,13 @@ function appendWhereClause(clauses: string[], sql: string): void {
 
 const inspectedRunSchema = runRecordSchema.extend({
   steps: z.array(stepRecordSchema),
+});
+
+const taskArtifactPageRowSchema = artifactRecordSchema.extend({
+  task_id: z.string().uuid(),
+  run_id: z.string().uuid(),
+  step_index: z.number().int().nonnegative(),
+  tool: z.string().min(1),
 });
 
 export class RuntimeDatabase {
@@ -425,6 +439,41 @@ export class RuntimeDatabase {
 
   getArtifact(artifactId: string): ArtifactRecord | undefined {
     return parseNullableRecord(artifactRecordSchema, this.sqlite.prepare('SELECT * FROM artifacts WHERE id = ?').get(artifactId));
+  }
+
+  countArtifactsByTask(taskId: string): number {
+    const row = this.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM artifacts
+         INNER JOIN steps ON artifacts.step_id = steps.id
+         INNER JOIN runs ON steps.run_id = runs.id
+         WHERE runs.task_id = ?`,
+      )
+      .get(taskId);
+    return z.object({ count: z.number() }).parse(row).count;
+  }
+
+  listArtifactsByTaskPage(taskId: string, page: PageInput): TaskArtifactPageRow[] {
+    return parseArrayRows(
+      taskArtifactPageRowSchema,
+      this.sqlite
+        .prepare(
+          `SELECT
+             artifacts.*,
+             runs.task_id AS task_id,
+             steps.run_id AS run_id,
+             steps."index" AS step_index,
+             steps.tool AS tool
+           FROM artifacts
+           INNER JOIN steps ON artifacts.step_id = steps.id
+           INNER JOIN runs ON steps.run_id = runs.id
+           WHERE runs.task_id = ?
+           ORDER BY runs.started_at DESC, steps."index" ASC, artifacts.created_at ASC
+           LIMIT ? OFFSET ?`,
+        )
+        .all(taskId, page.limit, page.offset),
+    );
   }
 
   createEvaluation(runId: string, score: number, issues: string[], suggestions: string[]): EvaluationRecord {

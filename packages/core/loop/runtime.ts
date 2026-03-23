@@ -56,6 +56,7 @@ export interface RunSummary {
 }
 
 export interface TaskArtifactView extends ArtifactRecord {
+  taskId: string;
   runId: string;
   stepIndex: number;
   tool: string;
@@ -85,6 +86,16 @@ export interface PageOptions {
 
 export interface RunEventPageFilter {
   level?: RunEventRecord['level'];
+}
+
+export interface TaskRunPageFilter {
+  status?: RunRecord['status'];
+}
+
+export interface TaskArtifactPageFilter {
+  runId?: string;
+  tool?: string;
+  type?: ArtifactRecord['type'];
 }
 
 export interface MaintenanceEventPageFilter {
@@ -118,6 +129,8 @@ export interface MaintenanceSummary {
   };
   latestEvent: MaintenanceEventRecord | null;
 }
+
+export type TaskOperatorAction = 'retry' | 'replan' | 'escalate' | 'cancel';
 
 export type RuntimeUpdateEvent =
   | {
@@ -170,6 +183,18 @@ function resolvePageOptions(page?: PageOptions): { limit: number; offset: number
   return {
     limit: page?.limit ?? 20,
     offset: page?.offset ?? 0,
+  };
+}
+
+function paginateItems<T>(items: T[], page?: PageOptions): { page: { total: number; limit: number; offset: number }; items: T[] } {
+  const resolvedPage = resolvePageOptions(page);
+  return {
+    page: {
+      total: items.length,
+      limit: resolvedPage.limit,
+      offset: resolvedPage.offset,
+    },
+    items: items.slice(resolvedPage.offset, resolvedPage.offset + resolvedPage.limit),
   };
 }
 
@@ -452,6 +477,28 @@ export class AgentRuntime {
     for (const subscriber of this.subscribers) {
       subscriber(enrichedEvent);
     }
+  }
+
+  private getLatestRunForTask(taskId: string): RunRecord | undefined {
+    return this.database.listRunsByTaskPage(taskId, { limit: 1, offset: 0 })[0];
+  }
+
+  private recordTaskOperatorAction(
+    taskId: string,
+    action: TaskOperatorAction,
+    fromState: TaskRecord['state'],
+    toState: TaskRecord['state'],
+  ): void {
+    const latestRun = this.getLatestRunForTask(taskId);
+    if (!latestRun) {
+      return;
+    }
+
+    this.createRunEvent(taskId, latestRun.id, 'warning', 'operator_action', {
+      action,
+      fromState,
+      toState,
+    });
   }
 
   private createRunEvent(
@@ -771,6 +818,34 @@ export class AgentRuntime {
     return this.database.inspectTask(taskId);
   }
 
+  getTaskView(taskId: string, page?: PageOptions, filter?: TaskRunPageFilter) {
+    this.requireTask(taskId);
+    const inspected = this.database.inspectTask(taskId);
+    const timeline = this.database.getTaskTimeline(taskId, { limit: 1, offset: 0 });
+    const task = inspected.task;
+    if (!task) {
+      throw new NotFoundError(`Task ${taskId} not found.`, { taskId });
+    }
+
+    const enrichedRuns = inspected.runs.map((run) => ({
+      run,
+      steps: run.steps,
+      events: this.database.listRunEvents(run.id),
+      evaluations: this.database.listEvaluationsByRun(run.id),
+    }));
+    const filteredRuns = filter?.status
+      ? enrichedRuns.filter((entry) => entry.run.status === filter.status)
+      : enrichedRuns;
+    const pagedRuns = paginateItems(filteredRuns, page);
+
+    return {
+      task,
+      approvals: timeline.approvals,
+      page: pagedRuns.page,
+      runs: pagedRuns.items.map((entry) => entry),
+    };
+  }
+
   getTaskTimeline(taskId: string, page?: PageOptions) {
     this.requireTask(taskId);
     return this.database.getTaskTimeline(taskId, resolvePageOptions(page));
@@ -839,6 +914,20 @@ export class AgentRuntime {
     };
   }
 
+  getRunView(runId: string, page?: PageOptions, filter?: RunEventPageFilter) {
+    const run = this.requireRun(runId);
+    const task = this.requireTask(run.task_id);
+    const eventsPage = this.getRunEvents(runId, page, filter);
+    return {
+      task,
+      run,
+      steps: this.database.listStepsByRun(runId),
+      evaluations: this.database.listEvaluationsByRun(runId),
+      eventsPage: eventsPage.page,
+      events: eventsPage.events,
+    };
+  }
+
   getArtifact(artifactId: string) {
     return this.database.getArtifact(artifactId);
   }
@@ -861,6 +950,7 @@ export class AgentRuntime {
 
     return {
       ...artifact,
+      taskId: run.task_id,
       runId: run.id,
       stepIndex: step.index,
       tool: step.tool,
@@ -873,12 +963,37 @@ export class AgentRuntime {
       run.steps.flatMap((step) =>
         this.database.listArtifactsByStep(step.id).map((artifact) => ({
           ...artifact,
+          taskId: run.task_id,
           runId: run.id,
           stepIndex: step.index,
           tool: step.tool,
         })),
       ),
     );
+  }
+
+  getTaskArtifactPage(taskId: string, page?: PageOptions, filter?: TaskArtifactPageFilter): {
+    page: { total: number; limit: number; offset: number };
+    artifacts: TaskArtifactView[];
+  } {
+    this.requireTask(taskId);
+    const filteredArtifacts = this.getTaskArtifacts(taskId).filter((artifact) => {
+      if (filter?.runId && artifact.runId !== filter.runId) {
+        return false;
+      }
+      if (filter?.tool && artifact.tool !== filter.tool) {
+        return false;
+      }
+      if (filter?.type && artifact.type !== filter.type) {
+        return false;
+      }
+      return true;
+    });
+    const pagedArtifacts = paginateItems(filteredArtifacts, page);
+    return {
+      page: pagedArtifacts.page,
+      artifacts: pagedArtifacts.items,
+    };
   }
 
   approve(approvalId: string): ApprovalRequestRecord {
@@ -917,6 +1032,65 @@ export class AgentRuntime {
       state: 'blocked',
     });
     return updated;
+  }
+
+  listTaskOperatorActions(taskId: string): TaskOperatorAction[] {
+    const task = this.requireTask(taskId);
+    switch (task.state) {
+      case 'failed':
+        return ['retry', 'replan', 'escalate', 'cancel'];
+      case 'blocked':
+        return ['retry', 'replan', 'escalate', 'cancel'];
+      case 'retryable':
+        return ['replan', 'escalate', 'cancel'];
+      case 'awaiting_approval':
+        return ['replan', 'cancel'];
+      case 'queued':
+        return ['cancel'];
+      case 'escalated':
+        return ['retry', 'replan', 'cancel'];
+      case 'cancelled':
+        return ['replan'];
+      default:
+        return [];
+    }
+  }
+
+  applyTaskOperatorAction(taskId: string, action: TaskOperatorAction): TaskRecord {
+    const task = this.requireTask(taskId);
+    let nextState: TaskRecord['state'];
+
+    switch (action) {
+      case 'retry':
+        nextState = 'retryable';
+        break;
+      case 'replan':
+        nextState = 'queued';
+        break;
+      case 'escalate':
+        nextState = 'escalated';
+        break;
+      case 'cancel':
+        nextState = 'cancelled';
+        break;
+      default:
+        throw new InvalidOperationError(`Unsupported task operator action ${action}.`, {
+          taskId,
+          action,
+        });
+    }
+
+    if (!this.listTaskOperatorActions(taskId).includes(action)) {
+      throw new InvalidOperationError(`Task action ${action} is not allowed in state ${task.state}.`, {
+        taskId,
+        action,
+        state: task.state,
+      });
+    }
+
+    const updatedTask = this.transitionTask(task, nextState);
+    this.recordTaskOperatorAction(taskId, action, task.state, updatedTask.state);
+    return updatedTask;
   }
 
   enqueueDueSchedules(now = Date.now()): TaskRecord[] {

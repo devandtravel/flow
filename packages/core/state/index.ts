@@ -9,12 +9,12 @@ const taskTransitions: Record<TaskState, TaskState[]> = {
   awaiting_approval: ['queued', 'cancelled', 'blocked'],
   verifying: ['completed', 'failed', 'retryable', 'rolled_back', 'escalated'],
   completed: [],
-  failed: ['retryable', 'escalated', 'rolled_back'],
-  retryable: ['planning', 'escalated'],
-  blocked: ['retryable', 'escalated', 'cancelled'],
-  cancelled: [],
+  failed: ['queued', 'retryable', 'escalated', 'rolled_back', 'cancelled'],
+  retryable: ['queued', 'planning', 'escalated', 'cancelled'],
+  blocked: ['queued', 'retryable', 'escalated', 'cancelled'],
+  cancelled: ['queued'],
   rolled_back: [],
-  escalated: [],
+  escalated: ['queued', 'retryable', 'cancelled'],
 };
 
 const runTransitions: Record<RunState, RunState[]> = {

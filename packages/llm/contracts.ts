@@ -57,6 +57,7 @@ function sanitizeToolCatalog(tools: ToolDefinition[]) {
     sideEffectClass: tool.sideEffectClass,
     reversibility: tool.reversibility,
     approvalClass: tool.approvalClass,
+    inputContract: tool.inputContract,
   }));
 }
 
@@ -210,6 +211,13 @@ export function buildPlanningPrompt(goal: string, memory: MemorySummary, tools: 
     '- encode each step input and expected value as a compact valid JSON object string in input_json and expected_json',
     '- use only concrete JSON values with double-quoted keys and string literals',
     '- never output pseudo-types, placeholders, unions, comments, angle brackets, or schema notation inside input_json or expected_json',
+    '- match each step input_json exactly to the tool inputContract keys; do not invent field names',
+    '- for fs.write_file, content must be the complete final file text, not a placeholder such as "string" or a short summary of the intended edit',
+    '- for repo.apply_patch, never use guessed context, placeholder lines, ellipses, or synthetic markers',
+    '- repo.apply_patch accepts either a valid unified diff or a FLOW patch that begins with "*** Update File:", "*** Add File:", or "*** Delete File:"',
+    '- only emit repo.apply_patch after reading the exact target file content needed for a valid patch',
+    '- if exact patch context is not yet known, add a read step first instead of guessing the patch',
+    '- when a safe append or replacement can be expressed more reliably through fs.read_file plus fs.write_file, prefer that sequence over a speculative patch',
   ].join('\n');
 }
 

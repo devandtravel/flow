@@ -17,16 +17,48 @@ import {
   type TaskRecord,
 } from '../domain';
 import type { TaskArtifactView } from '../core/loop/runtime';
+import { buildCursorPageEnvelope } from './pagination';
 
 const keyFactSchema = z.object({
   label: z.string().min(1),
   value: z.string().min(1),
 });
 
+const cursorPageSchema = z.object({
+  total: z.number().int().nonnegative(),
+  limit: z.number().int().positive(),
+  offset: z.number().int().nonnegative(),
+  nextCursor: z.string().nullable(),
+  previousCursor: z.string().nullable(),
+});
+
+const taskActionViewModelSchema = z.object({
+  action: z.enum(['retry', 'replan', 'escalate', 'cancel']),
+  label: z.string().min(1),
+  tone: z.enum(['default', 'warning', 'danger']),
+});
+
 const diffFileSchema = z.object({
   path: z.string().min(1),
   additions: z.number().int().nonnegative(),
   deletions: z.number().int().nonnegative(),
+  hunks: z.array(
+    z.object({
+      header: z.string().min(1),
+      oldStart: z.number().int().nonnegative(),
+      oldCount: z.number().int().nonnegative(),
+      newStart: z.number().int().nonnegative(),
+      newCount: z.number().int().nonnegative(),
+      lines: z.array(
+        z.object({
+          kind: z.enum(['context', 'add', 'delete']),
+          content: z.string(),
+          oldLineNumber: z.number().int().positive().nullable(),
+          newLineNumber: z.number().int().positive().nullable(),
+        }),
+      ),
+    }),
+  ),
 });
 
 const patchPreviewSchema = z.object({
@@ -49,6 +81,7 @@ const artifactSummarySchema = z.object({
 
 export const artifactBrowserItemViewModelSchema = z.object({
   artifact: artifactRecordSchema.extend({
+    taskId: z.string().uuid(),
     runId: z.string().uuid(),
     stepIndex: z.number().int().nonnegative(),
     tool: z.string().min(1),
@@ -73,11 +106,7 @@ export type ArtifactBrowserRunGroupViewModel = z.infer<typeof artifactBrowserRun
 
 export const artifactBrowserViewModelSchema = z.object({
   taskId: z.string().uuid(),
-  page: z.object({
-    total: z.number().int().nonnegative(),
-    limit: z.number().int().positive(),
-    offset: z.number().int().nonnegative(),
-  }),
+  page: cursorPageSchema,
   runs: z.array(artifactBrowserRunGroupViewModelSchema),
 });
 export type ArtifactBrowserViewModel = z.infer<typeof artifactBrowserViewModelSchema>;
@@ -104,12 +133,31 @@ export type RunSummaryViewModel = z.infer<typeof runSummaryViewModelSchema>;
 export const runViewModelSchema = z.object({
   task: taskRecordSchema,
   run: runRecordSchema,
+  eventsPage: cursorPageSchema,
   events: z.array(runEventRecordSchema),
   steps: z.array(stepRecordSchema),
   evaluations: z.array(evaluationRecordSchema),
   summary: runSummaryViewModelSchema.shape.summary,
+  taskActions: z.array(taskActionViewModelSchema),
 });
 export type RunViewModel = z.infer<typeof runViewModelSchema>;
+
+export const taskViewModelSchema = z.object({
+  task: taskRecordSchema,
+  approvals: z.array(approvalRequestRecordSchema),
+  runsPage: cursorPageSchema,
+  runs: z.array(runSummaryViewModelSchema),
+  summary: z.object({
+    latestRunId: z.string().uuid().nullable(),
+    latestRunState: z.string().nullable(),
+    latestRunChangedFiles: z.number().int().nonnegative(),
+    latestRunCompletedSteps: z.number().int().nonnegative(),
+    latestRunFailedSteps: z.number().int().nonnegative(),
+    updatedAt: z.string().min(1),
+  }),
+  actions: z.array(taskActionViewModelSchema),
+});
+export type TaskViewModel = z.infer<typeof taskViewModelSchema>;
 
 export const dashboardFiltersViewModelSchema = z.object({
   taskState: z.string(),
@@ -147,44 +195,120 @@ function toStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === 'string');
 }
 
+function parseHunkHeader(header: string): {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+} | null {
+  const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(header);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    oldStart: Number(match[1]),
+    oldCount: Number(match[2] ?? '1'),
+    newStart: Number(match[3]),
+    newCount: Number(match[4] ?? '1'),
+  };
+}
+
 function createPatchPreview(patch: string): z.infer<typeof patchPreviewSchema> {
-  const fileStats = new Map<string, { additions: number; deletions: number }>();
-  let currentFile = '';
+  const fileStats = new Map<string, z.infer<typeof diffFileSchema>>();
+  let currentFilePath = '';
+  let currentHunkIndex = -1;
+  let nextOldLineNumber = 0;
+  let nextNewLineNumber = 0;
   let hunkCount = 0;
   let additions = 0;
   let deletions = 0;
 
   for (const line of patch.split('\n')) {
     if (line.startsWith('+++ b/')) {
-      currentFile = line.replace('+++ b/', '').trim();
-      if (!fileStats.has(currentFile)) {
-        fileStats.set(currentFile, { additions: 0, deletions: 0 });
+      currentFilePath = line.replace('+++ b/', '').trim();
+      currentHunkIndex = -1;
+      if (!fileStats.has(currentFilePath)) {
+        fileStats.set(
+          currentFilePath,
+          diffFileSchema.parse({
+            path: currentFilePath,
+            additions: 0,
+            deletions: 0,
+            hunks: [],
+          }),
+        );
       }
       continue;
     }
     if (line.startsWith('@@')) {
+      if (!currentFilePath) {
+        continue;
+      }
+      const currentFile = fileStats.get(currentFilePath);
+      const hunkMeta = parseHunkHeader(line);
+      if (!currentFile || !hunkMeta) {
+        continue;
+      }
       hunkCount += 1;
+      currentFile.hunks.push({
+        header: line,
+        oldStart: hunkMeta.oldStart,
+        oldCount: hunkMeta.oldCount,
+        newStart: hunkMeta.newStart,
+        newCount: hunkMeta.newCount,
+        lines: [],
+      });
+      currentHunkIndex = currentFile.hunks.length - 1;
+      nextOldLineNumber = hunkMeta.oldStart;
+      nextNewLineNumber = hunkMeta.newStart;
       continue;
     }
+    const currentFile = currentFilePath ? fileStats.get(currentFilePath) : undefined;
+    const currentHunk =
+      currentFile && currentHunkIndex >= 0 && currentHunkIndex < currentFile.hunks.length
+        ? currentFile.hunks[currentHunkIndex]
+        : undefined;
+
+    if (!currentFile || !currentHunk) {
+      continue;
+    }
+
     if (line.startsWith('+') && !line.startsWith('+++')) {
       additions += 1;
-      if (currentFile) {
-        const entry = fileStats.get(currentFile);
-        if (entry) {
-          entry.additions += 1;
-        }
-      }
+      currentFile.additions += 1;
+      currentHunk.lines.push({
+        kind: 'add',
+        content: line.slice(1),
+        oldLineNumber: null,
+        newLineNumber: nextNewLineNumber,
+      });
+      nextNewLineNumber += 1;
       continue;
     }
     if (line.startsWith('-') && !line.startsWith('---')) {
       deletions += 1;
-      if (currentFile) {
-        const entry = fileStats.get(currentFile);
-        if (entry) {
-          entry.deletions += 1;
-        }
-      }
+      currentFile.deletions += 1;
+      currentHunk.lines.push({
+        kind: 'delete',
+        content: line.slice(1),
+        oldLineNumber: nextOldLineNumber,
+        newLineNumber: null,
+      });
+      nextOldLineNumber += 1;
+      continue;
     }
+    if (line.startsWith('\\')) {
+      continue;
+    }
+    currentHunk.lines.push({
+      kind: 'context',
+      content: line.startsWith(' ') ? line.slice(1) : line,
+      oldLineNumber: nextOldLineNumber,
+      newLineNumber: nextNewLineNumber,
+    });
+    nextOldLineNumber += 1;
+    nextNewLineNumber += 1;
   }
 
   return patchPreviewSchema.parse({
@@ -192,11 +316,7 @@ function createPatchPreview(patch: string): z.infer<typeof patchPreviewSchema> {
     hunkCount,
     additions,
     deletions,
-    files: [...fileStats.entries()].map((entry) => ({
-      path: entry[0],
-      additions: entry[1].additions,
-      deletions: entry[1].deletions,
-    })),
+    files: [...fileStats.values()],
   });
 }
 
@@ -330,14 +450,19 @@ export function buildArtifactPreviewViewModel(artifact: TaskArtifactView): Artif
 }
 
 export function buildArtifactBrowserViewModel(
-  taskId: string,
-  artifacts: TaskArtifactView[],
-  page: { limit: number; offset: number },
+  input: {
+    taskId: string;
+    artifacts: TaskArtifactView[];
+    page: {
+      total: number;
+      limit: number;
+      offset: number;
+    };
+  },
 ): ArtifactBrowserViewModel {
-  const pagedArtifacts = artifacts.slice(page.offset, page.offset + page.limit);
   const groupedRuns = new Map<string, Map<number, ArtifactBrowserStepGroupViewModel>>();
 
-  for (const artifact of pagedArtifacts) {
+  for (const artifact of input.artifacts) {
     if (!groupedRuns.has(artifact.runId)) {
       groupedRuns.set(artifact.runId, new Map<number, ArtifactBrowserStepGroupViewModel>());
     }
@@ -373,11 +498,9 @@ export function buildArtifactBrowserViewModel(
   }
 
   return artifactBrowserViewModelSchema.parse({
-    taskId,
+    taskId: input.taskId,
     page: {
-      total: artifacts.length,
-      limit: page.limit,
-      offset: page.offset,
+      ...buildCursorPageEnvelope(input.page),
     },
     runs: [...groupedRuns.entries()].map((entry) =>
       artifactBrowserRunGroupViewModelSchema.parse({
@@ -423,18 +546,14 @@ function resolveLatestEvent(events: RunEventRecord[]): { title: string | null; l
   };
 }
 
-export function buildRunViewModel(task: TaskRecord, run: RunRecord, steps: StepRecord[], events: RunEventRecord[], evaluations: EvaluationRecord[]): RunViewModel {
+function buildRunSummary(run: RunRecord, steps: StepRecord[], events: RunEventRecord[], evaluations: EvaluationRecord[]): RunSummaryViewModel {
   const completedSteps = steps.filter((step) => step.status === 'completed').length;
   const failedSteps = steps.filter((step) => step.status === 'failed').length;
   const latestEvent = resolveLatestEvent(events);
   const latestEvaluation = evaluations[evaluations.length - 1] ?? null;
 
-  return runViewModelSchema.parse({
-    task,
+  return runSummaryViewModelSchema.parse({
     run,
-    events,
-    steps,
-    evaluations,
     summary: {
       completedSteps,
       failedSteps,
@@ -443,6 +562,92 @@ export function buildRunViewModel(task: TaskRecord, run: RunRecord, steps: StepR
       latestEventTitle: latestEvent.title,
       latestEventLevel: latestEvent.level,
     },
+  });
+}
+
+function buildTaskActionViewModels(actions: Array<'retry' | 'replan' | 'escalate' | 'cancel'>): Array<z.infer<typeof taskActionViewModelSchema>> {
+  return actions.map((action) =>
+    taskActionViewModelSchema.parse({
+      action,
+      label:
+        action === 'retry'
+          ? 'Повторить'
+          : action === 'replan'
+            ? 'Построить новый план'
+            : action === 'escalate'
+              ? 'Эскалировать'
+              : 'Отменить',
+      tone:
+        action === 'escalate'
+          ? 'warning'
+          : action === 'cancel'
+            ? 'danger'
+            : 'default',
+    }),
+  );
+}
+
+export function buildTaskViewModel(input: {
+  task: TaskRecord;
+  approvals: ApprovalRequestRecord[];
+  runs: Array<{
+    run: RunRecord;
+    steps: StepRecord[];
+    events: RunEventRecord[];
+    evaluations: EvaluationRecord[];
+  }>;
+  page: {
+    total: number;
+    limit: number;
+    offset: number;
+  };
+  actions: Array<'retry' | 'replan' | 'escalate' | 'cancel'>;
+}): TaskViewModel {
+  const runSummaries = input.runs.map((entry) =>
+    buildRunSummary(entry.run, entry.steps, entry.events, entry.evaluations),
+  );
+  const latestRun = runSummaries[0] ?? null;
+
+  return taskViewModelSchema.parse({
+    task: input.task,
+    approvals: input.approvals,
+    runsPage: buildCursorPageEnvelope(input.page),
+    runs: runSummaries,
+    summary: {
+      latestRunId: latestRun ? latestRun.run.id : null,
+      latestRunState: latestRun ? latestRun.run.status : null,
+      latestRunChangedFiles: latestRun ? latestRun.summary.changedFiles.length : 0,
+      latestRunCompletedSteps: latestRun ? latestRun.summary.completedSteps : 0,
+      latestRunFailedSteps: latestRun ? latestRun.summary.failedSteps : 0,
+      updatedAt: input.task.updated_at,
+    },
+    actions: buildTaskActionViewModels(input.actions),
+  });
+}
+
+export function buildRunViewModel(
+  task: TaskRecord,
+  run: RunRecord,
+  steps: StepRecord[],
+  events: RunEventRecord[],
+  evaluations: EvaluationRecord[],
+  page: {
+    total: number;
+    limit: number;
+    offset: number;
+  },
+  actions: Array<'retry' | 'replan' | 'escalate' | 'cancel'>,
+): RunViewModel {
+  const summary = buildRunSummary(run, steps, events, evaluations);
+  return runViewModelSchema.parse({
+    task,
+    run,
+    eventsPage: buildCursorPageEnvelope(page),
+    events,
+    steps,
+    evaluations,
+    summary: summary.summary,
+    taskActions: buildTaskActionViewModels(actions),
   });
 }
 

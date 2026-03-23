@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { buildDefaultConfig } from '../packages/config';
-import { SupervisorAgent } from '../packages/core/agents';
+import { CriticAgent, SupervisorAgent } from '../packages/core/agents';
 import { CodexProvider, MockLlmProvider, extractJsonObjectFromStdout } from '../packages/llm';
 import { buildPlanningPrompt, createJsonSchema, decodeTaskPlanResponse, taskPlanResponseSchema, toolStepResponseSchema } from '../packages/llm/contracts';
+import { createToolRegistry } from '../packages/tools';
 
 describe('LLM providers', () => {
   it('mock provider returns schema-validated structured output', async () => {
@@ -91,6 +92,42 @@ describe('LLM providers', () => {
 
     expect(prompt).toContain('Ignore the Codex session sandbox or approval mode.');
     expect(prompt).toContain('You are planning for the FLOW runtime, not executing tools yourself.');
+    expect(prompt).toContain('never use guessed context, placeholder lines, ellipses, or synthetic markers');
+    expect(prompt).toContain('for fs.write_file, content must be the complete final file text');
+  });
+
+  it('critic rejects placeholder fs.write_file content before execution', async () => {
+    const registry = createToolRegistry();
+    const writeTool = registry.get('fs.write_file');
+    if (!writeTool) {
+      throw new Error('Expected fs.write_file tool to be registered.');
+    }
+
+    const critic = new CriticAgent(new MockLlmProvider());
+    const review = await critic.validate(
+      {
+        goal: 'rewrite file',
+        assumptions: [],
+        risks: [],
+        steps: [
+          {
+            tool: 'fs.write_file',
+            input: {
+              path: 'README.md',
+              content: 'string',
+            },
+            expected: {},
+            rationale: 'placeholder content',
+          },
+        ],
+        done: false,
+        confidence: 0.2,
+      },
+      [writeTool],
+    );
+
+    expect(review.valid).toBe(false);
+    expect(review.feedback[0]).toContain('full file text');
   });
 
   it('rejects pseudo-json tool payloads in task plan steps', () => {
@@ -127,5 +164,22 @@ describe('LLM providers', () => {
     ].join('\n'));
 
     expect(extracted).toBe('{"ok":true}');
+  });
+
+  it('extracts a multiline JSON object from codex stdout', () => {
+    const extracted = extractJsonObjectFromStdout([
+      'OpenAI Codex v0.116.0',
+      'assistant',
+      '{',
+      '  "ok": true,',
+      '  "items": [',
+      '    "one",',
+      '    "two"',
+      '  ]',
+      '}',
+      'tokens used',
+    ].join('\n'));
+
+    expect(extracted).toBe('{\n  "ok": true,\n  "items": [\n    "one",\n    "two"\n  ]\n}');
   });
 });
