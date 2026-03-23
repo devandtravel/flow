@@ -20,6 +20,11 @@ describe('AgentRuntime', () => {
     expect(summary.artifacts.length).toBeGreaterThanOrEqual(4);
     expect(existsSync(path.join(workspaceRoot, 'agent-output.txt'))).toBe(true);
     expect(runtime.listTasks()).toHaveLength(1);
+    const runEvents = runtime.getRunEvents(summary.runId, { limit: 20, offset: 0 });
+    const eventMessages = runEvents.events.map((event) => event.message);
+    expect(eventMessages).toEqual(
+      expect.arrayContaining(['run_started', 'planning_started', 'planning_completed', 'step_started', 'step_completed', 'run_completed']),
+    );
   });
 
   it('moves a sensitive step into the approval queue and resumes after approval', async () => {
@@ -139,6 +144,26 @@ describe('AgentRuntime', () => {
     expect(timeline.approvals).toHaveLength(1);
     expect(timeline.runs.length).toBeGreaterThanOrEqual(2);
     expect(timeline.runs[0]?.events.length).toBeGreaterThan(0);
+  });
+
+  it('publishes runtime updates for task and run lifecycle changes', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-stream-'));
+    const config = buildDefaultConfig(workspaceRoot, 'project');
+    config.llm.provider = 'mock';
+    config.autonomy.mode = 'autonomous';
+    const runtime = new AgentRuntime({ workspaceRoot, config });
+    const events: string[] = [];
+    const unsubscribe = runtime.subscribe((event) => {
+      events.push(event.kind);
+    });
+
+    const task = runtime.createTask('write stream output');
+    await runtime.runTask(task.id);
+    unsubscribe();
+
+    expect(events).toEqual(
+      expect.arrayContaining(['task_changed', 'run_changed', 'run_event']),
+    );
   });
 
   it('rejects conflicting target roots and protects target deletion with task history', async () => {

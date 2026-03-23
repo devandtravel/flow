@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { buildDefaultConfig } from '../packages/config';
-import { CodexProvider, MockLlmProvider } from '../packages/llm';
+import { SupervisorAgent } from '../packages/core/agents';
+import { CodexProvider, MockLlmProvider, extractJsonObjectFromStdout } from '../packages/llm';
 import { buildPlanningPrompt, createJsonSchema, decodeTaskPlanResponse, taskPlanResponseSchema, toolStepResponseSchema } from '../packages/llm/contracts';
 
 describe('LLM providers', () => {
@@ -101,5 +102,30 @@ describe('LLM providers', () => {
         rationale: 'invalid expected payload',
       }),
     ).toThrow();
+  });
+
+  it('supervisor escalates cleanly when max iterations are reached', async () => {
+    const supervisor = new SupervisorAgent(new MockLlmProvider());
+    const decision = await supervisor.decide({
+      hadFailure: true,
+      iteration: 2,
+      maxIterations: 2,
+      failures: ['first failure', 'second failure'],
+    });
+
+    expect(decision.decision).toBe('escalate');
+    expect(decision.reason).toContain('first failure; second failure');
+  });
+
+  it('extracts the last JSON object from codex stdout when output file is missing', () => {
+    const extracted = extractJsonObjectFromStdout([
+      'OpenAI Codex v0.116.0',
+      'codex',
+      '{"ok":true}',
+      'tokens used',
+      '23031',
+    ].join('\n'));
+
+    expect(extracted).toBe('{"ok":true}');
   });
 });

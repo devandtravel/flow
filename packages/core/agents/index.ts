@@ -15,6 +15,14 @@ import {
 } from '../../llm/contracts';
 import type { ToolDefinition, ToolResult } from '../../tools';
 
+function describeFailures(failures: string[]): string {
+  if (failures.length === 0) {
+    return 'unknown failure';
+  }
+
+  return failures.join('; ');
+}
+
 export class PlannerAgent {
   constructor(private readonly provider: LlmProvider) {}
 

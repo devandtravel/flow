@@ -55,6 +55,12 @@ export interface RunSummary {
   metrics: ReturnType<MetricsCollector['snapshot']>;
 }
 
+export interface TaskArtifactView extends ArtifactRecord {
+  runId: string;
+  stepIndex: number;
+  tool: string;
+}
+
 export interface CleanupResult {
   maintenanceEventId: string;
   dryRun: boolean;
@@ -112,6 +118,53 @@ export interface MaintenanceSummary {
   };
   latestEvent: MaintenanceEventRecord | null;
 }
+
+export type RuntimeUpdateEvent =
+  | {
+      kind: 'task_changed';
+      timestamp: string;
+      taskId: string;
+      state: TaskRecord['state'];
+    }
+  | {
+      kind: 'run_changed';
+      timestamp: string;
+      taskId: string;
+      runId: string;
+      state: RunRecord['status'];
+    }
+  | {
+      kind: 'run_event';
+      timestamp: string;
+      taskId: string;
+      runId: string;
+      level: RunEventRecord['level'];
+      message: string;
+    }
+  | {
+      kind: 'approval_changed';
+      timestamp: string;
+      taskId: string;
+      runId: string;
+      approvalId: string;
+      status: ApprovalRequestRecord['status'];
+    }
+  | {
+      kind: 'maintenance_changed';
+      timestamp: string;
+      operation: MaintenanceEventRecord['operation'];
+      maintenanceEventId: string;
+    }
+  | {
+      kind: 'target_changed';
+      timestamp: string;
+      targetId: string;
+    }
+  | {
+      kind: 'schedule_changed';
+      timestamp: string;
+      scheduleId: string;
+    };
 
 function resolvePageOptions(page?: PageOptions): { limit: number; offset: number } {
   return {
@@ -175,6 +228,7 @@ export class AgentRuntime {
   private readonly evaluator: EvaluatorAgent;
   private readonly artifactsDir: string;
   private readonly changedFilesByRun = new Map<string, Set<string>>();
+  private readonly subscribers = new Set<(event: RuntimeUpdateEvent) => void>();
 
   constructor(options: RuntimeOptions) {
     this.workspaceRoot = options.workspaceRoot;
@@ -342,17 +396,41 @@ export class AgentRuntime {
 
   private transitionTask(task: TaskRecord, nextState: TaskRecord['state']): TaskRecord {
     assertValidTaskTransition(task.state, nextState);
-    return this.database.updateTaskState(task.id, nextState);
+    const updatedTask = this.database.updateTaskState(task.id, nextState);
+    this.emitRuntimeUpdate({
+      kind: 'task_changed',
+      taskId: updatedTask.id,
+      state: updatedTask.state,
+    });
+    return updatedTask;
   }
 
   private transitionRun(run: RunRecord, nextState: RunRecord['status']): RunRecord {
     assertValidRunTransition(run.status, nextState);
-    return this.database.updateRunState(run.id, nextState);
+    const updatedRun = this.database.updateRunState(run.id, nextState);
+    this.emitRuntimeUpdate({
+      kind: 'run_changed',
+      taskId: updatedRun.task_id,
+      runId: updatedRun.id,
+      state: updatedRun.status,
+    });
+    return updatedRun;
   }
 
   private transitionStep(step: StepRecord, nextState: StepRecord['status']): StepRecord {
     assertValidStepTransition(step.status, nextState);
     return this.database.updateStepStatus(step.id, nextState);
+  }
+
+  private finishRun(run: RunRecord, nextState: RunRecord['status']): RunRecord {
+    const finishedRun = this.database.finishRun(run.id, nextState);
+    this.emitRuntimeUpdate({
+      kind: 'run_changed',
+      taskId: finishedRun.task_id,
+      runId: finishedRun.id,
+      state: finishedRun.status,
+    });
+    return finishedRun;
   }
 
   private getChangedFilesSet(runId: string): Set<string> {
@@ -364,6 +442,41 @@ export class AgentRuntime {
     const created = new Set<string>();
     this.changedFilesByRun.set(runId, created);
     return created;
+  }
+
+  private emitRuntimeUpdate(event: Omit<RuntimeUpdateEvent, 'timestamp'>): void {
+    const enrichedEvent = {
+      ...event,
+      timestamp: new Date().toISOString(),
+    };
+    for (const subscriber of this.subscribers) {
+      subscriber(enrichedEvent);
+    }
+  }
+
+  private createRunEvent(
+    taskId: string,
+    runId: string,
+    level: RunEventRecord['level'],
+    message: string,
+    payload: Record<string, unknown>,
+  ): RunEventRecord {
+    const event = this.database.createRunEvent(runId, level, message, payload);
+    this.emitRuntimeUpdate({
+      kind: 'run_event',
+      taskId,
+      runId,
+      level,
+      message,
+    });
+    return event;
+  }
+
+  subscribe(listener: (event: RuntimeUpdateEvent) => void): () => void {
+    this.subscribers.add(listener);
+    return () => {
+      this.subscribers.delete(listener);
+    };
   }
 
   private createArtifacts(
@@ -462,7 +575,13 @@ export class AgentRuntime {
       throw new InvalidOperationError('No target is configured for task creation.');
     }
 
-    return this.database.createTask(goal, resolvedTargetId, priority);
+    const createdTask = this.database.createTask(goal, resolvedTargetId, priority);
+    this.emitRuntimeUpdate({
+      kind: 'task_changed',
+      taskId: createdTask.id,
+      state: createdTask.state,
+    });
+    return createdTask;
   }
 
   listTasks(): TaskRecord[] {
@@ -505,6 +624,10 @@ export class AgentRuntime {
       read_paths: target.read_paths,
       write_paths: target.write_paths,
     });
+    this.emitRuntimeUpdate({
+      kind: 'target_changed',
+      targetId: target.id,
+    });
     return persisted;
   }
 
@@ -519,6 +642,10 @@ export class AgentRuntime {
     }
 
     this.database.deleteTarget(targetId);
+    this.emitRuntimeUpdate({
+      kind: 'target_changed',
+      targetId,
+    });
   }
 
   listSchedules() {
@@ -526,7 +653,12 @@ export class AgentRuntime {
   }
 
   upsertSchedule(input: { id: string; goal: string; targetId?: string; intervalSeconds: number; enabled: boolean }) {
-    return this.database.upsertSchedule(input.id, input.goal, input.targetId, input.intervalSeconds, input.enabled);
+    const persistedSchedule = this.database.upsertSchedule(input.id, input.goal, input.targetId, input.intervalSeconds, input.enabled);
+    this.emitRuntimeUpdate({
+      kind: 'schedule_changed',
+      scheduleId: persistedSchedule.id,
+    });
+    return persistedSchedule;
   }
 
   cleanupState(options?: {
@@ -611,6 +743,12 @@ export class AgentRuntime {
         deletedArtifactPaths,
       },
     );
+
+    this.emitRuntimeUpdate({
+      kind: 'maintenance_changed',
+      operation: maintenanceEvent.operation,
+      maintenanceEventId: maintenanceEvent.id,
+    });
 
     return {
       maintenanceEventId: maintenanceEvent.id,
@@ -705,10 +843,60 @@ export class AgentRuntime {
     return this.database.getArtifact(artifactId);
   }
 
+  getArtifactView(artifactId: string): TaskArtifactView {
+    const artifact = this.database.getArtifact(artifactId);
+    if (!artifact) {
+      throw new NotFoundError(`Artifact ${artifactId} not found.`, { artifactId });
+    }
+
+    const step = this.database.getStep(artifact.step_id);
+    if (!step) {
+      throw new NotFoundError(`Step for artifact ${artifactId} not found.`, { artifactId, stepId: artifact.step_id });
+    }
+
+    const run = this.database.getRun(step.run_id);
+    if (!run) {
+      throw new NotFoundError(`Run for artifact ${artifactId} not found.`, { artifactId, runId: step.run_id });
+    }
+
+    return {
+      ...artifact,
+      runId: run.id,
+      stepIndex: step.index,
+      tool: step.tool,
+    };
+  }
+
+  getTaskArtifacts(taskId: string): TaskArtifactView[] {
+    this.requireTask(taskId);
+    return this.database.inspectTask(taskId).runs.flatMap((run) =>
+      run.steps.flatMap((step) =>
+        this.database.listArtifactsByStep(step.id).map((artifact) => ({
+          ...artifact,
+          runId: run.id,
+          stepIndex: step.index,
+          tool: step.tool,
+        })),
+      ),
+    );
+  }
+
   approve(approvalId: string): ApprovalRequestRecord {
     const approval = approvalInputSchema.parse({ id: approvalId });
     const updated = this.database.updateApprovalStatus(approval.id, 'approved');
     this.database.updateTaskState(updated.task_id, 'queued');
+    this.emitRuntimeUpdate({
+      kind: 'approval_changed',
+      taskId: updated.task_id,
+      runId: updated.run_id,
+      approvalId: updated.id,
+      status: updated.status,
+    });
+    this.emitRuntimeUpdate({
+      kind: 'task_changed',
+      taskId: updated.task_id,
+      state: 'queued',
+    });
     return updated;
   }
 
@@ -716,6 +904,18 @@ export class AgentRuntime {
     const approval = approvalInputSchema.parse({ id: approvalId });
     const updated = this.database.updateApprovalStatus(approval.id, 'rejected');
     this.database.updateTaskState(updated.task_id, 'blocked');
+    this.emitRuntimeUpdate({
+      kind: 'approval_changed',
+      taskId: updated.task_id,
+      runId: updated.run_id,
+      approvalId: updated.id,
+      status: updated.status,
+    });
+    this.emitRuntimeUpdate({
+      kind: 'task_changed',
+      taskId: updated.task_id,
+      state: 'blocked',
+    });
     return updated;
   }
 
@@ -783,12 +983,17 @@ export class AgentRuntime {
       const run = this.database.createRun(task.id, iteration, 'queued');
       lastRunId = run.id;
       this.transitionRun(run, 'planning');
-      this.database.createRunEvent(run.id, 'info', 'run_started', { taskId: task.id, iteration, targetId: task.target_id });
+      this.createRunEvent(task.id, run.id, 'info', 'run_started', { taskId: task.id, iteration, targetId: task.target_id });
+      this.createRunEvent(task.id, run.id, 'info', 'planning_started', { taskId: task.id, targetId: task.target_id });
 
       const planSource = await this.resolveApprovedStep(task);
       if (!planSource.approval) {
         try {
           lastPlan = await this.planTask(task, target);
+          this.createRunEvent(task.id, run.id, 'info', 'planning_completed', {
+            stepCount: lastPlan.steps.length,
+            confidence: lastPlan.confidence,
+          });
           const review = await this.critic.validate(lastPlan, listToolDefinitions(this.tools).filter((tool) => target.capabilities.includes(tool.capability)));
           lastPlan = review.plan;
           task = this.transitionTask(task, 'validating');
@@ -797,9 +1002,9 @@ export class AgentRuntime {
           if (!review.valid) {
             this.metrics.recordFailure('plan_validation');
             this.memory.recordFailure(`plan:${run.id}`, { reason: review.feedback.join('; ') || 'Plan validation failed.' });
-            this.database.createRunEvent(run.id, 'error', 'plan_invalid', { feedback: review.feedback });
-            this.database.finishRun(run.id, 'failed');
-            task = this.database.updateTaskState(task.id, 'failed');
+            this.createRunEvent(task.id, run.id, 'error', 'plan_invalid', { feedback: review.feedback });
+            this.finishRun(run, 'failed');
+            task = this.transitionTask(task, 'failed');
             const decision = await this.supervisor.decide({
               hadFailure: true,
               iteration,
@@ -819,9 +1024,9 @@ export class AgentRuntime {
           const failureMessage = error instanceof Error ? error.message : 'Plan generation failed.';
           this.metrics.recordFailure('plan_generation');
           this.memory.recordFailure(`plan:${run.id}`, { reason: failureMessage });
-          this.database.createRunEvent(run.id, 'error', 'plan_generation_failed', { error: failureMessage });
-          this.database.finishRun(run.id, 'failed');
-          task = this.database.updateTaskState(task.id, 'failed');
+          this.createRunEvent(task.id, run.id, 'error', 'plan_generation_failed', { error: failureMessage });
+          this.finishRun(run, 'failed');
+          task = this.transitionTask(task, 'failed');
           const decision = await this.supervisor.decide({
             hadFailure: true,
             iteration,
@@ -866,6 +1071,10 @@ export class AgentRuntime {
 
         const stepRecord = this.database.createStep(run.id, index, step.tool, step.input, step.expected);
         this.transitionStep(stepRecord, 'started');
+        this.createRunEvent(task.id, run.id, 'info', 'step_started', {
+          step: step.tool,
+          stepIndex: index,
+        });
         const approvalMatchesCurrentStep =
           planSource.approval &&
           planSource.approval.status === 'approved' &&
@@ -921,7 +1130,14 @@ export class AgentRuntime {
           const awaitingStep = this.transitionStep(this.database.getStep(stepRecord.id) ?? stepRecord, 'awaiting_approval');
           const approval = this.database.createApprovalRequest(task.id, run.id, index, step.tool, step.input, policyDecision.reason);
           createdApprovals.push(approval);
-          this.database.createRunEvent(run.id, 'warning', 'approval_requested', { approvalId: approval.id, step: step.tool });
+          this.createRunEvent(task.id, run.id, 'warning', 'approval_requested', { approvalId: approval.id, step: step.tool });
+          this.emitRuntimeUpdate({
+            kind: 'approval_changed',
+            taskId: task.id,
+            runId: run.id,
+            approvalId: approval.id,
+            status: approval.status,
+          });
           createdArtifacts.push(
             ...this.createArtifacts(
               awaitingStep,
@@ -940,7 +1156,7 @@ export class AgentRuntime {
               { verified: false, evidence: policyDecision.reason },
             ),
           );
-          this.database.finishRun(run.id, 'awaiting_approval');
+          this.finishRun(run, 'awaiting_approval');
           task = this.transitionTask(task, 'awaiting_approval');
           return {
             task,
@@ -965,7 +1181,7 @@ export class AgentRuntime {
         );
 
         createdArtifacts.push(...this.createArtifacts(completedStep, { step }, result, verification));
-        this.database.createRunEvent(run.id, verification.verified ? 'info' : 'error', 'step_completed', {
+        this.createRunEvent(task.id, run.id, verification.verified ? 'info' : 'error', 'step_completed', {
           step: step.tool,
           verified: verification.verified,
         });
@@ -1008,15 +1224,15 @@ export class AgentRuntime {
 
       if (hadFailure) {
         this.metrics.recordFailure(failures[0] ?? 'execution_failure');
-        this.database.finishRun(run.id, 'failed');
-        task = this.database.updateTaskState(task.id, 'failed');
+        this.finishRun(run, 'failed');
+        task = this.transitionTask(task, 'failed');
         const decision = await this.supervisor.decide({
           hadFailure: true,
           iteration,
           maxIterations: this.config.limits.max_iterations,
           failures,
         });
-        this.database.createRunEvent(run.id, decision.decision === 'escalate' ? 'error' : 'warning', 'supervisor_decision', {
+        this.createRunEvent(task.id, run.id, decision.decision === 'escalate' ? 'error' : 'warning', 'supervisor_decision', {
           decision: decision.decision,
           reason: decision.reason,
         });
@@ -1036,7 +1252,12 @@ export class AgentRuntime {
         this.database.updateApprovalStatus(planSource.approval.id, 'consumed');
       }
 
-      this.database.finishRun(run.id, 'completed');
+      this.finishRun(run, 'completed');
+      this.createRunEvent(task.id, run.id, 'info', 'run_completed', {
+        verifiedSteps,
+        totalSteps: lastPlan.steps.length,
+        score: evaluation.score,
+      });
       task = this.transitionTask(task, 'completed');
       this.metrics.recordRun(true, lastPlan.steps.length);
       break;

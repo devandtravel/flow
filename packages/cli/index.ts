@@ -70,14 +70,17 @@ program
   .command('daemon')
   .description('Start the REST API daemon')
   .action(async () => {
+    const config = loadConfig(workspaceRoot);
     const api = createApiServer(workspaceRoot);
-    await api.start();
+    await api.start({ worker: true });
     console.log(
       JSON.stringify(
         {
           status: 'listening',
-          host: loadConfig(workspaceRoot).server.host,
-          port: loadConfig(workspaceRoot).server.port,
+          host: config.server.host,
+          port: config.server.port,
+          uiUrl: `http://${config.server.host}:${String(config.server.port)}/`,
+          worker: 'started',
         },
         null,
         2,

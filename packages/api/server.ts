@@ -1,11 +1,22 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import { URL } from 'node:url';
 import { z } from 'zod';
-import { AgentRuntime } from '../core/loop/runtime';
+import { AgentRuntime, type RuntimeUpdateEvent } from '../core/loop/runtime';
 import { loadConfig, type RuntimeConfig } from '../config';
-import { capabilityNameSchema, eventLevelSchema, maintenanceOperationSchema, maintenanceTriggerSchema } from '../domain';
+import { approvalStatusSchema, capabilityNameSchema, eventLevelSchema, maintenanceOperationSchema, maintenanceTriggerSchema, taskStateSchema } from '../domain';
 import { isDomainError } from '../errors';
+import { getDashboardAsset } from './ui';
+import {
+  buildArtifactBrowserViewModel,
+  buildArtifactPreviewViewModel,
+  buildDashboardFiltersViewModel,
+  buildRunViewModel,
+  filterApprovalsByStatus,
+  filterRunEventsByLevel,
+  filterTasksByState,
+} from './view-models';
 
 const createTaskBodySchema = z.object({
   goal: z.string().min(1),
@@ -44,6 +55,16 @@ const pageQuerySchema = z.object({
   offset: z.number().int().nonnegative().optional(),
 });
 
+const logQuerySchema = z.object({
+  tail: z.number().int().positive().max(5000).optional(),
+});
+
+const dashboardFilterQuerySchema = z.object({
+  taskState: taskStateSchema.optional(),
+  approvalStatus: approvalStatusSchema.optional(),
+  eventLevel: eventLevelSchema.optional(),
+});
+
 function parsePageQuery(requestUrl: URL): z.infer<typeof pageQuerySchema> {
   const limitValue = requestUrl.searchParams.get('limit');
   const offsetValue = requestUrl.searchParams.get('offset');
@@ -58,6 +79,29 @@ function parseRunEventFilter(requestUrl: URL): { level?: z.infer<typeof eventLev
   return {
     level: levelValue ? eventLevelSchema.parse(levelValue) : undefined,
   };
+}
+
+function parseLogQuery(requestUrl: URL): z.infer<typeof logQuerySchema> {
+  const tailValue = requestUrl.searchParams.get('tail');
+  return logQuerySchema.parse({
+    tail: tailValue ? Number(tailValue) : undefined,
+  });
+}
+
+function parseDashboardFilterQuery(requestUrl: URL): z.infer<typeof dashboardFilterQuerySchema> {
+  const taskStateValue = requestUrl.searchParams.get('taskState');
+  const approvalStatusValue = requestUrl.searchParams.get('approvalStatus');
+  const eventLevelValue = requestUrl.searchParams.get('eventLevel');
+  return dashboardFilterQuerySchema.parse({
+    taskState: taskStateValue ? taskStateSchema.parse(taskStateValue) : undefined,
+    approvalStatus: approvalStatusValue ? approvalStatusSchema.parse(approvalStatusValue) : undefined,
+    eventLevel: eventLevelValue ? eventLevelSchema.parse(eventLevelValue) : undefined,
+  });
+}
+
+function tailText(content: string, lineCount: number): string {
+  const lines = content.split('\n');
+  return lines.slice(Math.max(lines.length - lineCount, 0)).join('\n');
 }
 
 function parseMaintenanceEventFilter(requestUrl: URL): {
@@ -98,6 +142,16 @@ function sendJson(response: ServerResponse, statusCode: number, payload: unknown
   response.end(JSON.stringify(payload, null, 2));
 }
 
+function sendText(response: ServerResponse, statusCode: number, payload: string, contentType: string): void {
+  response.statusCode = statusCode;
+  response.setHeader('content-type', contentType);
+  response.end(payload);
+}
+
+function writeServerEvent(response: ServerResponse, event: RuntimeUpdateEvent | { kind: 'connected'; timestamp: string }): void {
+  response.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+
 function mapErrorToStatusCode(error: unknown): number {
   if (error instanceof z.ZodError) {
     return 422;
@@ -125,10 +179,17 @@ function mapErrorToStatusCode(error: unknown): number {
 export function createApiServer(workspaceRoot: string, configOverride?: RuntimeConfig) {
   const config = configOverride ?? loadConfig(workspaceRoot);
   const runtime = new AgentRuntime({ workspaceRoot, config });
+  let workerController: AbortController | undefined;
 
   const server = createServer(async (request, response) => {
     try {
       const requestUrl = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`);
+      const dashboardAsset = getDashboardAsset(requestUrl.pathname);
+
+      if (request.method === 'GET' && dashboardAsset) {
+        sendText(response, 200, dashboardAsset.body, dashboardAsset.contentType);
+        return;
+      }
 
       if (request.method === 'GET' && requestUrl.pathname === '/health') {
         sendJson(response, 200, {
@@ -141,6 +202,69 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
 
       if (request.method === 'GET' && requestUrl.pathname === '/metrics') {
         sendJson(response, 200, runtime.metrics.snapshot());
+        return;
+      }
+
+      if (request.method === 'GET' && requestUrl.pathname === '/dashboard/state') {
+        const taskId = requestUrl.searchParams.get('taskId');
+        const filters = parseDashboardFilterQuery(requestUrl);
+        const tasks = filterTasksByState(runtime.listTasks(), filters.taskState);
+        const approvals = filterApprovalsByStatus(runtime.listApprovals(), filters.approvalStatus);
+        const timeline = taskId ? runtime.getTaskTimeline(taskId, { limit: 20, offset: 0 }) : undefined;
+        sendJson(response, 200, {
+          health: {
+            status: 'ok',
+            mode: config.mode,
+            autonomy: config.autonomy.mode,
+          },
+          filters: buildDashboardFiltersViewModel(filters),
+          tasks,
+          approvals,
+          targets: runtime.listTargets(),
+          schedules: runtime.listSchedules(),
+          maintenance: {
+            status: runtime.getMaintenanceStatus(),
+            summary: runtime.getMaintenanceSummary(),
+          },
+          metrics: runtime.metrics.snapshot(),
+          timeline: timeline
+            ? {
+                ...timeline,
+                runs: timeline.runs.map((run) => ({
+                  ...run,
+                  events: filterRunEventsByLevel(run.events, filters.eventLevel),
+                })),
+              }
+            : undefined,
+        });
+        return;
+      }
+
+      if (request.method === 'GET' && requestUrl.pathname === '/stream') {
+        response.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache, no-transform',
+          connection: 'keep-alive',
+        });
+
+        writeServerEvent(response, {
+          kind: 'connected',
+          timestamp: new Date().toISOString(),
+        });
+
+        const unsubscribe = runtime.subscribe((event) => {
+          writeServerEvent(response, event);
+        });
+
+        const keepAlive = setInterval(() => {
+          response.write(': keep-alive\n\n');
+        }, 15000);
+
+        request.on('close', () => {
+          clearInterval(keepAlive);
+          unsubscribe();
+          response.end();
+        });
         return;
       }
 
@@ -164,6 +288,14 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
 
       if (request.method === 'GET' && requestUrl.pathname.startsWith('/tasks/')) {
         const taskId = requestUrl.pathname.split('/')[2];
+        if (requestUrl.pathname.endsWith('/artifacts/browser')) {
+          sendJson(response, 200, buildArtifactBrowserViewModel(taskId, runtime.getTaskArtifacts(taskId)));
+          return;
+        }
+        if (requestUrl.pathname.endsWith('/artifacts')) {
+          sendJson(response, 200, runtime.getTaskArtifacts(taskId));
+          return;
+        }
         if (requestUrl.pathname.endsWith('/timeline')) {
           sendJson(response, 200, runtime.getTaskTimeline(taskId, parsePageQuery(requestUrl)));
           return;
@@ -279,6 +411,27 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
 
       if (request.method === 'GET' && requestUrl.pathname.startsWith('/runs/')) {
         const runId = requestUrl.pathname.split('/')[2];
+        if (requestUrl.pathname.endsWith('/view')) {
+          const filters = parseDashboardFilterQuery(requestUrl);
+          const runPayload = runtime.getRun(runId);
+          const task = runtime.inspectTask(runPayload.run.task_id).task;
+          if (!task) {
+            sendJson(response, 404, { error: 'Task not found for run' });
+            return;
+          }
+          sendJson(
+            response,
+            200,
+            buildRunViewModel(
+              task,
+              runPayload.run,
+              runPayload.steps,
+              filterRunEventsByLevel(runPayload.events, filters.eventLevel),
+              runPayload.evaluations,
+            ),
+          );
+          return;
+        }
         if (requestUrl.pathname.endsWith('/events')) {
           sendJson(response, 200, runtime.getRunEvents(runId, parsePageQuery(requestUrl), parseRunEventFilter(requestUrl)));
           return;
@@ -296,9 +449,26 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
           return;
         }
 
+        if (requestUrl.pathname.endsWith('/view')) {
+          sendJson(response, 200, buildArtifactPreviewViewModel(runtime.getArtifactView(artifactId)));
+          return;
+        }
+
         sendJson(response, 200, {
           artifact,
           content: readFileSync(artifact.path, 'utf8'),
+        });
+        return;
+      }
+
+      if (request.method === 'GET' && requestUrl.pathname === '/logs/runtime') {
+        const query = parseLogQuery(requestUrl);
+        const logsPath = path.join(workspaceRoot, '.agent', 'logs', 'runtime.log');
+        const content = existsSync(logsPath) ? readFileSync(logsPath, 'utf8') : '';
+        sendJson(response, 200, {
+          path: logsPath,
+          tail: query.tail ?? 400,
+          content: tailText(content, query.tail ?? 400),
         });
         return;
       }
@@ -313,13 +483,30 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
   return {
     runtime,
     server,
-    start() {
+    start(options?: { worker?: boolean }) {
       return new Promise<void>((resolve) => {
-        server.listen(config.server.port, config.server.host, () => resolve());
+        server.listen(config.server.port, config.server.host, () => {
+          if (options?.worker === true) {
+            this.startWorker();
+          }
+          resolve();
+        });
       });
+    },
+    startWorker() {
+      if (workerController) {
+        return;
+      }
+
+      workerController = new AbortController();
+      void runtime.startWorkerLoop(workerController.signal);
     },
     stop() {
       return new Promise<void>((resolve, reject) => {
+        if (workerController) {
+          workerController.abort();
+          workerController = undefined;
+        }
         server.close((error) => {
           if (error) {
             reject(error);

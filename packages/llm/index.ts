@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -22,6 +22,27 @@ export interface LlmRequest<TOutput> {
 
 export interface LlmProvider {
   complete<TOutput>(request: LlmRequest<TOutput>): Promise<TOutput>;
+}
+
+export function extractJsonObjectFromStdout(stdout: string): string | undefined {
+  const lines = stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const candidate = lines[index];
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return candidate;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return undefined;
 }
 
 function createHeuristicPlan(goal: string): TaskPlan {
@@ -175,7 +196,21 @@ export class CodexProvider implements LlmProvider {
       });
     }
 
-    const raw = readFileSync(outputPath, 'utf8');
+    const raw =
+      existsSync(outputPath)
+        ? readFileSync(outputPath, 'utf8')
+        : extractJsonObjectFromStdout(execution.stdout) ?? '';
+
+    if (raw.length === 0) {
+      throw new InvalidOperationError('Codex completed without producing structured output.', {
+        executable: this.config.executable,
+        model: this.config.model,
+        stdout: execution.stdout,
+        stderr: execution.stderr,
+        outputPath,
+      });
+    }
+
     const parsed = JSON.parse(raw);
     return request.schema.parse(parsed);
   }

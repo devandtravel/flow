@@ -7,11 +7,16 @@ import { createApiServer } from '../packages/api/server';
 
 let workspaceRoot = '';
 let api: ReturnType<typeof createApiServer>;
+let nextPort = 4310;
+let currentBaseUrl = '';
 
 beforeEach(async () => {
   workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-api-'));
   const config = buildDefaultConfig(workspaceRoot, 'system');
   config.llm.provider = 'mock';
+  config.server.port = nextPort;
+  currentBaseUrl = `http://127.0.0.1:${String(nextPort)}`;
+  nextPort += 1;
   api = createApiServer(workspaceRoot, config);
   await api.start();
 });
@@ -21,8 +26,28 @@ afterEach(async () => {
 });
 
 describe('API server', () => {
+  it('serves dashboard assets and aggregated state', async () => {
+    const dashboardResponse = await fetch(`${currentBaseUrl}/`);
+    expect(dashboardResponse.status).toBe(200);
+    expect(dashboardResponse.headers.get('content-type')).toContain('text/html');
+
+    const dashboardStateResponse = await fetch(`${currentBaseUrl}/dashboard/state`);
+    expect(dashboardStateResponse.status).toBe(200);
+    const dashboardStateJson = await dashboardStateResponse.json();
+    expect(dashboardStateJson).toEqual(
+      expect.objectContaining({
+        health: expect.objectContaining({
+          status: 'ok',
+        }),
+        tasks: expect.any(Array),
+        approvals: expect.any(Array),
+        targets: expect.any(Array),
+      }),
+    );
+  });
+
   it('creates and runs a task through the REST API', async () => {
-    const response = await fetch('http://127.0.0.1:4310/tasks', {
+    const response = await fetch(`${currentBaseUrl}/tasks`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ goal: 'write api output', autorun: true }),
@@ -41,85 +66,12 @@ describe('API server', () => {
 
     expect(summaryJson.state).toBe('completed');
 
-    const approvalsResponse = await fetch('http://127.0.0.1:4310/approvals');
+    const approvalsResponse = await fetch(`${currentBaseUrl}/approvals`);
     const approvalsJson = await approvalsResponse.json();
     expect(Array.isArray(approvalsJson)).toBe(true);
 
-    const targetsResponse = await fetch('http://127.0.0.1:4310/targets');
-    const targetsJson = await targetsResponse.json();
-    expect(Array.isArray(targetsJson)).toBe(true);
-
-    const targetCreateResponse = await fetch('http://127.0.0.1:4310/targets', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        id: 'service-b',
-        root: path.join(workspaceRoot, 'service-b'),
-        readPaths: ['.'],
-        writePaths: ['.'],
-        capabilities: ['fs.read', 'fs.write', 'repo.test'],
-      }),
-    });
-    expect(targetCreateResponse.status).toBe(201);
-
-    const targetShowResponse = await fetch('http://127.0.0.1:4310/targets/service-b');
-    expect(targetShowResponse.status).toBe(200);
-    const targetShowJson = await targetShowResponse.json();
-    expect(targetShowJson).toEqual(
-      expect.objectContaining({
-        id: 'service-b',
-      }),
-    );
-
-    const conflictingTargetResponse = await fetch('http://127.0.0.1:4310/targets', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        id: 'service-b-conflict',
-        root: path.join(workspaceRoot, 'service-b', 'nested'),
-        readPaths: ['.'],
-        writePaths: ['.'],
-        capabilities: ['fs.read'],
-      }),
-    });
-    expect(conflictingTargetResponse.status).toBe(409);
-
-    const invalidTargetResponse = await fetch('http://127.0.0.1:4310/targets', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        id: 'invalid-target',
-        root: path.join(workspaceRoot, 'invalid-target'),
-        readPaths: [],
-        writePaths: ['.'],
-        capabilities: ['fs.read'],
-      }),
-    });
-    expect(invalidTargetResponse.status).toBe(422);
-
-    const scheduleCreateResponse = await fetch('http://127.0.0.1:4310/schedules', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        id: 'nightly-write',
-        goal: 'write scheduled api output',
-        intervalSeconds: 3600,
-        enabled: true,
-      }),
-    });
-    expect(scheduleCreateResponse.status).toBe(201);
-
-    const schedulesResponse = await fetch('http://127.0.0.1:4310/schedules');
-    const schedulesJson = await schedulesResponse.json();
-    expect(Array.isArray(schedulesJson)).toBe(true);
-
-    const workerResponse = await fetch('http://127.0.0.1:4310/worker/run-once', {
-      method: 'POST',
-    });
-    expect(workerResponse.status).toBe(200);
-
     if ('task' in summaryJson && summaryJson.task && typeof summaryJson.task === 'object' && 'id' in summaryJson.task && typeof summaryJson.task.id === 'string') {
-      const timelineResponse = await fetch(`http://127.0.0.1:4310/tasks/${summaryJson.task.id}/timeline?limit=1&offset=0`);
+      const timelineResponse = await fetch(`${currentBaseUrl}/tasks/${summaryJson.task.id}/timeline?limit=1&offset=0`);
       const timelineJson = await timelineResponse.json();
       expect(timelineResponse.status).toBe(200);
       expect(timelineJson).toEqual(
@@ -137,7 +89,7 @@ describe('API server', () => {
     }
 
     if ('runId' in summaryJson && typeof summaryJson.runId === 'string') {
-      const runEventsResponse = await fetch(`http://127.0.0.1:4310/runs/${summaryJson.runId}/events?limit=1&offset=0`);
+      const runEventsResponse = await fetch(`${currentBaseUrl}/runs/${summaryJson.runId}/events?limit=1&offset=0`);
       expect(runEventsResponse.status).toBe(200);
       const runEventsJson = await runEventsResponse.json();
       expect(runEventsJson).toEqual(
@@ -150,11 +102,101 @@ describe('API server', () => {
         }),
       );
 
-      const filteredRunEventsResponse = await fetch(`http://127.0.0.1:4310/runs/${summaryJson.runId}/events?limit=10&offset=0&level=info`);
+      const filteredRunEventsResponse = await fetch(`${currentBaseUrl}/runs/${summaryJson.runId}/events?limit=10&offset=0&level=info`);
       expect(filteredRunEventsResponse.status).toBe(200);
     }
 
-    const updatedTargetsResponse = await fetch('http://127.0.0.1:4310/targets');
+    if ('task' in summaryJson && summaryJson.task && typeof summaryJson.task === 'object' && 'id' in summaryJson.task && typeof summaryJson.task.id === 'string') {
+      const dashboardTaskStateResponse = await fetch(`${currentBaseUrl}/dashboard/state?taskId=${summaryJson.task.id}`);
+      expect(dashboardTaskStateResponse.status).toBe(200);
+      const dashboardTaskStateJson = await dashboardTaskStateResponse.json();
+      expect(dashboardTaskStateJson).toEqual(
+        expect.objectContaining({
+          timeline: expect.objectContaining({
+            task: expect.objectContaining({
+              id: summaryJson.task.id,
+            }),
+          }),
+        }),
+      );
+    }
+  }, 10000);
+
+  it('manages targets, schedules, and maintenance endpoints', async () => {
+    const targetsResponse = await fetch(`${currentBaseUrl}/targets`);
+    const targetsJson = await targetsResponse.json();
+    expect(Array.isArray(targetsJson)).toBe(true);
+
+    const targetCreateResponse = await fetch(`${currentBaseUrl}/targets`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'service-b',
+        root: path.join(workspaceRoot, 'service-b'),
+        readPaths: ['.'],
+        writePaths: ['.'],
+        capabilities: ['fs.read', 'fs.write', 'repo.test'],
+      }),
+    });
+    expect(targetCreateResponse.status).toBe(201);
+
+    const targetShowResponse = await fetch(`${currentBaseUrl}/targets/service-b`);
+    expect(targetShowResponse.status).toBe(200);
+    const targetShowJson = await targetShowResponse.json();
+    expect(targetShowJson).toEqual(
+      expect.objectContaining({
+        id: 'service-b',
+      }),
+    );
+
+    const conflictingTargetResponse = await fetch(`${currentBaseUrl}/targets`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'service-b-conflict',
+        root: path.join(workspaceRoot, 'service-b', 'nested'),
+        readPaths: ['.'],
+        writePaths: ['.'],
+        capabilities: ['fs.read'],
+      }),
+    });
+    expect(conflictingTargetResponse.status).toBe(409);
+
+    const invalidTargetResponse = await fetch(`${currentBaseUrl}/targets`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'invalid-target',
+        root: path.join(workspaceRoot, 'invalid-target'),
+        readPaths: [],
+        writePaths: ['.'],
+        capabilities: ['fs.read'],
+      }),
+    });
+    expect(invalidTargetResponse.status).toBe(422);
+
+    const scheduleCreateResponse = await fetch(`${currentBaseUrl}/schedules`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'nightly-write',
+        goal: 'write scheduled api output',
+        intervalSeconds: 3600,
+        enabled: true,
+      }),
+    });
+    expect(scheduleCreateResponse.status).toBe(201);
+
+    const schedulesResponse = await fetch(`${currentBaseUrl}/schedules`);
+    const schedulesJson = await schedulesResponse.json();
+    expect(Array.isArray(schedulesJson)).toBe(true);
+
+    const workerResponse = await fetch(`${currentBaseUrl}/worker/run-once`, {
+      method: 'POST',
+    });
+    expect(workerResponse.status).toBe(200);
+
+    const updatedTargetsResponse = await fetch(`${currentBaseUrl}/targets`);
     const updatedTargetsJson = await updatedTargetsResponse.json();
     expect(Array.isArray(updatedTargetsJson)).toBe(true);
     expect(updatedTargetsJson).toEqual(
@@ -165,21 +207,21 @@ describe('API server', () => {
       ]),
     );
 
-    const deleteTargetResponse = await fetch('http://127.0.0.1:4310/targets/service-b', {
+    const deleteTargetResponse = await fetch(`${currentBaseUrl}/targets/service-b`, {
       method: 'DELETE',
     });
     expect(deleteTargetResponse.status).toBe(200);
 
-    const missingTargetResponse = await fetch('http://127.0.0.1:4310/targets/missing-target');
+    const missingTargetResponse = await fetch(`${currentBaseUrl}/targets/missing-target`);
     expect(missingTargetResponse.status).toBe(404);
 
-    const missingTaskResponse = await fetch('http://127.0.0.1:4310/tasks/missing-task-id');
+    const missingTaskResponse = await fetch(`${currentBaseUrl}/tasks/missing-task-id`);
     expect(missingTaskResponse.status).toBe(404);
 
-    const missingRunResponse = await fetch('http://127.0.0.1:4310/runs/00000000-0000-0000-0000-000000000000');
+    const missingRunResponse = await fetch(`${currentBaseUrl}/runs/00000000-0000-0000-0000-000000000000`);
     expect(missingRunResponse.status).toBe(404);
 
-    const cleanupResponse = await fetch('http://127.0.0.1:4310/maintenance/cleanup', {
+    const cleanupResponse = await fetch(`${currentBaseUrl}/maintenance/cleanup`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -209,7 +251,7 @@ describe('API server', () => {
       }),
     );
 
-    const maintenanceStatusResponse = await fetch('http://127.0.0.1:4310/maintenance/status');
+    const maintenanceStatusResponse = await fetch(`${currentBaseUrl}/maintenance/status`);
     expect(maintenanceStatusResponse.status).toBe(200);
     const maintenanceStatusJson = await maintenanceStatusResponse.json();
     expect(maintenanceStatusJson).toEqual(
@@ -220,7 +262,7 @@ describe('API server', () => {
       }),
     );
 
-    const maintenanceSummaryResponse = await fetch('http://127.0.0.1:4310/maintenance/summary');
+    const maintenanceSummaryResponse = await fetch(`${currentBaseUrl}/maintenance/summary`);
     expect(maintenanceSummaryResponse.status).toBe(200);
     const maintenanceSummaryJson = await maintenanceSummaryResponse.json();
     expect(maintenanceSummaryJson).toEqual(
@@ -233,7 +275,7 @@ describe('API server', () => {
       }),
     );
 
-    const maintenanceEventsResponse = await fetch('http://127.0.0.1:4310/maintenance/events?limit=10&offset=0&operation=cleanup&dryRun=true&trigger=api_manual');
+    const maintenanceEventsResponse = await fetch(`${currentBaseUrl}/maintenance/events?limit=10&offset=0&operation=cleanup&dryRun=true&trigger=api_manual`);
     expect(maintenanceEventsResponse.status).toBe(200);
     const maintenanceEventsJson = await maintenanceEventsResponse.json();
     expect(maintenanceEventsJson).toEqual(
@@ -247,7 +289,7 @@ describe('API server', () => {
       }),
     );
 
-    const maintenanceRunDueResponse = await fetch('http://127.0.0.1:4310/maintenance/run-due', {
+    const maintenanceRunDueResponse = await fetch(`${currentBaseUrl}/maintenance/run-due`, {
       method: 'POST',
     });
     expect(maintenanceRunDueResponse.status).toBe(200);
@@ -257,5 +299,5 @@ describe('API server', () => {
         status: 'idle',
       }),
     );
-  });
+  }, 10000);
 });
