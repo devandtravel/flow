@@ -34,16 +34,31 @@ describe('API server', () => {
     const dashboardStateResponse = await fetch(`${currentBaseUrl}/dashboard/state`);
     expect(dashboardStateResponse.status).toBe(200);
     const dashboardStateJson = await dashboardStateResponse.json();
-    expect(dashboardStateJson).toEqual(
+    expect(dashboardStateJson.health).toEqual(
       expect.objectContaining({
-        health: expect.objectContaining({
-          status: 'ok',
-        }),
-        tasks: expect.any(Array),
-        approvals: expect.any(Array),
-        targets: expect.any(Array),
+        status: 'ok',
       }),
     );
+    expect(Array.isArray(dashboardStateJson.tasks)).toBe(true);
+    expect(Array.isArray(dashboardStateJson.approvals)).toBe(true);
+    expect(Array.isArray(dashboardStateJson.targets)).toBe(true);
+  });
+
+  it('returns dashboard state without 404 for a stale task selection', async () => {
+    const staleTaskId = '843db5d1-e9e1-4820-8583-14094f3d80b9';
+    const dashboardStateResponse = await fetch(`${currentBaseUrl}/dashboard/state?taskId=${staleTaskId}`);
+    expect(dashboardStateResponse.status).toBe(200);
+    const dashboardStateJson = await dashboardStateResponse.json();
+    expect(dashboardStateJson).toEqual(
+      expect.objectContaining({
+        selection: expect.objectContaining({
+          requestedTaskId: staleTaskId,
+          resolvedTaskId: '',
+          requestedTaskMissing: true,
+        }),
+      }),
+    );
+    expect(dashboardStateJson.timeline).toBeUndefined();
   });
 
   it('creates and runs a task through the REST API', async () => {
@@ -104,6 +119,21 @@ describe('API server', () => {
 
       const filteredRunEventsResponse = await fetch(`${currentBaseUrl}/runs/${summaryJson.runId}/events?limit=10&offset=0&level=info`);
       expect(filteredRunEventsResponse.status).toBe(200);
+
+      const runViewResponse = await fetch(`${currentBaseUrl}/runs/${summaryJson.runId}/view?eventLevel=info`);
+      expect(runViewResponse.status).toBe(200);
+      const runViewJson = await runViewResponse.json();
+      expect(runViewJson).toEqual(
+        expect.objectContaining({
+          run: expect.objectContaining({
+            id: summaryJson.runId,
+          }),
+          summary: expect.objectContaining({
+            completedSteps: expect.any(Number),
+            changedFiles: expect.any(Array),
+          }),
+        }),
+      );
     }
 
     if ('task' in summaryJson && summaryJson.task && typeof summaryJson.task === 'object' && 'id' in summaryJson.task && typeof summaryJson.task.id === 'string') {
@@ -116,6 +146,51 @@ describe('API server', () => {
             task: expect.objectContaining({
               id: summaryJson.task.id,
             }),
+          }),
+        }),
+      );
+
+      const filteredDashboardResponse = await fetch(
+        `${currentBaseUrl}/dashboard/state?taskId=${summaryJson.task.id}&taskState=completed&approvalStatus=pending&eventLevel=info&runLimit=5&runOffset=0`,
+      );
+      expect(filteredDashboardResponse.status).toBe(200);
+      const filteredDashboardJson = await filteredDashboardResponse.json();
+      expect(filteredDashboardJson).toEqual(
+        expect.objectContaining({
+          filters: expect.objectContaining({
+            taskState: 'completed',
+            approvalStatus: 'pending',
+            eventLevel: 'info',
+          }),
+        }),
+      );
+
+      const artifactBrowserResponse = await fetch(`${currentBaseUrl}/tasks/${summaryJson.task.id}/artifacts/browser?limit=8&offset=0`);
+      expect(artifactBrowserResponse.status).toBe(200);
+      const artifactBrowserJson = await artifactBrowserResponse.json();
+      expect(artifactBrowserJson).toEqual(
+        expect.objectContaining({
+          taskId: summaryJson.task.id,
+          page: expect.objectContaining({
+            limit: 8,
+            offset: 0,
+          }),
+          runs: expect.any(Array),
+        }),
+      );
+
+      const artifactId = artifactBrowserJson.runs?.[0]?.steps?.[0]?.artifacts?.[0]?.artifact?.id;
+      expect(typeof artifactId).toBe('string');
+      const artifactViewResponse = await fetch(`${currentBaseUrl}/artifacts/${artifactId}/view`);
+      expect(artifactViewResponse.status).toBe(200);
+      const artifactViewJson = await artifactViewResponse.json();
+      expect(artifactViewJson).toEqual(
+        expect.objectContaining({
+          artifact: expect.objectContaining({
+            id: artifactId,
+          }),
+          summary: expect.objectContaining({
+            title: expect.any(String),
           }),
         }),
       );

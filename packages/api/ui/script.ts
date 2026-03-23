@@ -42,6 +42,7 @@ const terminalStates = ['completed', 'failed', 'escalated', 'blocked', 'cancelle
 const storageKeys = {
   selectedTaskId: 'flow.ui.selectedTaskId',
   selectedRunId: 'flow.ui.selectedRunId',
+  selectedArtifactId: 'flow.ui.selectedArtifactId',
   activeView: 'flow.ui.activeView',
   pollingPaused: 'flow.ui.pollingPaused',
   taskFilter: 'flow.ui.taskFilter',
@@ -66,7 +67,14 @@ const state = {
   taskFilter: '',
   eventLevelFilter: '',
   approvalFilter: '',
+  runPageOffset: 0,
+  artifactPageOffset: 0,
   lastLoadedData: null,
+};
+
+const pageSize = {
+  runs: 6,
+  artifacts: 12,
 };
 
 let streamConnection = null;
@@ -102,6 +110,7 @@ function loadPersistedState() {
   const storedTaskFilter = safeReadStorage(storageKeys.taskFilter);
   const storedEventLevelFilter = safeReadStorage(storageKeys.eventLevelFilter);
   const storedApprovalFilter = safeReadStorage(storageKeys.approvalFilter);
+  const storedArtifactId = safeReadStorage(storageKeys.selectedArtifactId);
   if (storedTaskId) {
     state.selectedTaskId = storedTaskId;
   }
@@ -111,6 +120,9 @@ function loadPersistedState() {
   }
   if (storedRunId) {
     state.selectedRunId = storedRunId;
+  }
+  if (storedArtifactId) {
+    state.selectedArtifactId = storedArtifactId;
   }
   if (storedPolling === 'true') {
     state.pollingPaused = true;
@@ -124,6 +136,7 @@ function loadPersistedState() {
 function persistUiState() {
   safeWriteStorage(storageKeys.selectedTaskId, state.selectedTaskId);
   safeWriteStorage(storageKeys.selectedRunId, state.selectedRunId);
+  safeWriteStorage(storageKeys.selectedArtifactId, state.selectedArtifactId);
   safeWriteStorage(storageKeys.activeView, state.activeView);
   safeWriteStorage(storageKeys.pollingPaused, state.pollingPaused ? 'true' : 'false');
   safeWriteStorage(storageKeys.taskFilter, state.taskFilter);
@@ -140,12 +153,16 @@ function applyHashState() {
   const params = new URLSearchParams(hash);
   const taskId = params.get('task');
   const runId = params.get('run');
+  const artifactId = params.get('artifact');
   const view = params.get('view');
   if (taskId) {
     state.selectedTaskId = taskId;
   }
   if (runId) {
     state.selectedRunId = runId;
+  }
+  if (artifactId) {
+    state.selectedArtifactId = artifactId;
   }
   if (view === 'overview' || view === 'artifacts' || view === 'logs' || view === 'run') {
     state.activeView = view;
@@ -159,6 +176,9 @@ function syncHashState() {
   }
   if (state.selectedRunId) {
     params.set('run', state.selectedRunId);
+  }
+  if (state.selectedArtifactId) {
+    params.set('artifact', state.selectedArtifactId);
   }
   if (state.activeView !== 'overview') {
     params.set('view', state.activeView);
@@ -228,6 +248,43 @@ function matchesApprovalFilter(approval) {
 
 function matchesEventLevel(event) {
   return state.eventLevelFilter.length === 0 || event.level === state.eventLevelFilter;
+}
+
+function recoverMissingSelection(error) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  if (error.message.includes('Task ') && error.message.includes(' not found')) {
+    state.selectedTaskId = '';
+    state.selectedRunId = '';
+    state.selectedArtifactId = '';
+    if (state.activeView === 'run' || state.activeView === 'artifacts') {
+      state.activeView = 'overview';
+    }
+    persistUiState();
+    return true;
+  }
+
+  if (error.message.includes('Run ') && error.message.includes(' not found')) {
+    state.selectedRunId = '';
+    if (state.activeView === 'run') {
+      state.activeView = 'overview';
+    }
+    persistUiState();
+    return true;
+  }
+
+  if (error.message.includes('Artifact ') && error.message.includes(' not found')) {
+    state.selectedArtifactId = '';
+    if (state.activeView === 'artifacts') {
+      state.activeView = 'overview';
+    }
+    persistUiState();
+    return true;
+  }
+
+  return false;
 }
 
 function parseJson(value) {
@@ -460,6 +517,25 @@ function renderFilterBar() {
     '</select></div>',
     '</div>',
     '</section>',
+  ].join('');
+}
+
+function renderPager(kind, page) {
+  if (!page || typeof page.total !== 'number' || page.total <= page.limit) {
+    return '';
+  }
+
+  const previousOffset = Math.max(page.offset - page.limit, 0);
+  const nextOffset = page.offset + page.limit;
+  const canGoBack = page.offset > 0;
+  const canGoForward = nextOffset < page.total;
+
+  return [
+    '<div class="toolbar pager">',
+    '<button type="button" class="button secondary" data-page-kind="' + escapeHtml(kind) + '" data-page-offset="' + escapeHtml(String(previousOffset)) + '"' + (canGoBack ? '' : ' disabled') + '>Previous</button>',
+    '<div class="meta">Showing ' + escapeHtml(String(page.offset + 1)) + '–' + escapeHtml(String(Math.min(page.offset + page.limit, page.total))) + ' of ' + escapeHtml(String(page.total)) + '</div>',
+    '<button type="button" class="button secondary" data-page-kind="' + escapeHtml(kind) + '" data-page-offset="' + escapeHtml(String(nextOffset)) + '"' + (canGoForward ? '' : ' disabled') + '>Next</button>',
+    '</div>',
   ].join('');
 }
 
@@ -1044,7 +1120,7 @@ function renderOverview(timeline, maintenance, metrics) {
           ? '<section class="stack"><div class="section-heading">Task approvals</div>' + renderApprovals(timeline.approvals) + '</section>'
           : '',
         Array.isArray(timeline.runs) && timeline.runs.length > 0
-          ? '<section class="stack">' + timeline.runs.map(renderRun).join('') + '</section>'
+          ? '<section class="stack">' + renderPager('runs', timeline.page) + timeline.runs.map(renderRun).join('') + '</section>'
           : '<div class="empty">Запусков ещё нет.</div>',
         '</section>',
       ].join('');
@@ -1248,7 +1324,7 @@ function renderArtifacts(artifactBrowser, artifactContent) {
 
   return [
     '<section class="split">',
-    '<section class="panel stack"><div class="toolbar spread"><h2>Artifacts</h2>' + renderPill('task scope', '') + '</div><div class="list">' + artifactList + '</div></section>',
+    '<section class="panel stack"><div class="toolbar spread"><h2>Artifacts</h2>' + renderPill('task scope', '') + '</div>' + renderPager('artifacts', artifactBrowser ? artifactBrowser.page : null) + '<div class="list">' + artifactList + '</div></section>',
     '<section class="stack">' + artifactPreview + '</section>',
     '</section>',
   ].join('');
@@ -1496,6 +1572,8 @@ function bindShellEvents() {
         state.selectedTaskId = taskId;
         state.selectedRunId = '';
         state.selectedArtifactId = '';
+        state.runPageOffset = 0;
+        state.artifactPageOffset = 0;
         persistUiState();
         void refreshDashboard({ showLoading: false, force: true });
       }
@@ -1543,6 +1621,23 @@ function bindShellEvents() {
       return;
     }
 
+    const pagerNode = event.target.closest('[data-page-kind]');
+    if (pagerNode instanceof HTMLElement) {
+      const pageKind = pagerNode.getAttribute('data-page-kind');
+      const pageOffsetValue = pagerNode.getAttribute('data-page-offset');
+      const pageOffset = pageOffsetValue ? Number(pageOffsetValue) : 0;
+      if (Number.isFinite(pageOffset)) {
+        if (pageKind === 'runs') {
+          state.runPageOffset = pageOffset;
+        }
+        if (pageKind === 'artifacts') {
+          state.artifactPageOffset = pageOffset;
+        }
+        void refreshDashboard({ showLoading: false, force: true });
+      }
+      return;
+    }
+
     const tabNode = event.target.closest('[data-view]');
     if (tabNode instanceof HTMLElement) {
       const nextView = tabNode.getAttribute('data-view');
@@ -1563,15 +1658,17 @@ function bindShellEvents() {
       return;
     }
     const filterType = filterNode.getAttribute('data-filter');
-    if (filterType === 'task-state') {
-      state.taskFilter = filterNode.value;
-    }
-    if (filterType === 'event-level') {
-      state.eventLevelFilter = filterNode.value;
-    }
-    if (filterType === 'approval-status') {
-      state.approvalFilter = filterNode.value;
-    }
+      if (filterType === 'task-state') {
+        state.taskFilter = filterNode.value;
+        state.runPageOffset = 0;
+      }
+      if (filterType === 'event-level') {
+        state.eventLevelFilter = filterNode.value;
+        state.runPageOffset = 0;
+      }
+      if (filterType === 'approval-status') {
+        state.approvalFilter = filterNode.value;
+      }
     persistUiState();
     if (state.lastLoadedData) {
       updateViewContent(state.lastLoadedData);
@@ -1620,6 +1717,8 @@ async function submitTask(goalInput, targetSelect) {
       state.selectedRunId = '';
       state.activeView = 'overview';
       state.selectedArtifactId = '';
+      state.runPageOffset = 0;
+      state.artifactPageOffset = 0;
       goalInput.value = '';
       persistUiState();
     }
@@ -1739,15 +1838,51 @@ async function loadDashboardData() {
   if (state.eventLevelFilter) {
     query.set('eventLevel', state.eventLevelFilter);
   }
+  query.set('runLimit', String(pageSize.runs));
+  query.set('runOffset', String(state.runPageOffset));
   let dashboard = await fetchJson('/dashboard/state' + (query.toString() ? '?' + query.toString() : ''));
+  const resolvedSelectedTaskIdFromDashboard =
+    dashboard &&
+    typeof dashboard === 'object' &&
+    dashboard.selection &&
+    typeof dashboard.selection === 'object' &&
+    typeof dashboard.selection.resolvedTaskId === 'string'
+      ? dashboard.selection.resolvedTaskId
+      : '';
+  const hasResolvedSelectedTask =
+    resolvedSelectedTaskIdFromDashboard.length > 0;
+
+  const requestedTaskMissing =
+    dashboard &&
+    typeof dashboard === 'object' &&
+    dashboard.selection &&
+    typeof dashboard.selection === 'object' &&
+    dashboard.selection.requestedTaskMissing === true;
+
+  let effectiveSelectedTaskId = state.selectedTaskId;
+  if (requestedTaskMissing) {
+    effectiveSelectedTaskId = '';
+    state.selectedTaskId = '';
+    state.selectedRunId = '';
+    state.selectedArtifactId = '';
+    if (state.activeView === 'run' || state.activeView === 'artifacts') {
+      state.activeView = 'overview';
+    }
+    persistUiState();
+  }
 
   if (Array.isArray(dashboard.tasks)) {
-    const preferredTaskId = getPreferredTaskId(dashboard.tasks);
-    if (preferredTaskId && preferredTaskId !== state.selectedTaskId) {
+    const preferredTaskId = hasResolvedSelectedTask
+      ? resolvedSelectedTaskIdFromDashboard
+      : getPreferredTaskId(dashboard.tasks);
+    if (preferredTaskId && preferredTaskId !== effectiveSelectedTaskId) {
+      effectiveSelectedTaskId = preferredTaskId;
       state.selectedTaskId = preferredTaskId;
       persistUiState();
       query.set('taskId', state.selectedTaskId);
       dashboard = await fetchJson('/dashboard/state?' + query.toString());
+    } else if (!preferredTaskId) {
+      effectiveSelectedTaskId = '';
     }
   }
 
@@ -1756,8 +1891,12 @@ async function loadDashboardData() {
   let logs = null;
   let runView = null;
 
-  if (state.selectedTaskId) {
-    artifactBrowser = await fetchJson('/tasks/' + encodeURIComponent(state.selectedTaskId) + '/artifacts/browser');
+  if (resolvedSelectedTaskIdFromDashboard && effectiveSelectedTaskId === resolvedSelectedTaskIdFromDashboard) {
+    const artifactQuery = new URLSearchParams({
+      limit: String(pageSize.artifacts),
+      offset: String(state.artifactPageOffset),
+    });
+    artifactBrowser = await fetchJson('/tasks/' + encodeURIComponent(resolvedSelectedTaskIdFromDashboard) + '/artifacts/browser?' + artifactQuery.toString());
     const artifactItems =
       artifactBrowser && Array.isArray(artifactBrowser.runs)
         ? artifactBrowser.runs.flatMap((runGroup) =>
@@ -1772,6 +1911,7 @@ async function loadDashboardData() {
         : [];
     ensureSelectedArtifactId(artifactItems);
   } else {
+    state.selectedTaskId = '';
     state.selectedArtifactId = '';
   }
 
@@ -1859,6 +1999,7 @@ function renderLoadingState() {
 async function refreshDashboard(options) {
   const showLoading = options && options.showLoading === true;
   const force = options && options.force === true;
+  const allowRecovery = !options || options.allowRecovery !== false;
   if (state.refreshInFlight && !force) {
     return;
   }
@@ -1876,6 +2017,11 @@ async function refreshDashboard(options) {
     persistUiState();
     updateViewContent(loadedData);
   } catch (error) {
+    if (allowRecovery && recoverMissingSelection(error)) {
+      state.lastError = '';
+      await refreshDashboard({ showLoading: false, force: true, allowRecovery: false });
+      return;
+    }
     state.lastError = error instanceof Error ? error.message : 'Не удалось обновить dashboard.';
     updateNotification();
   } finally {

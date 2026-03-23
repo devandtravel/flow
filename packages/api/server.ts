@@ -12,6 +12,7 @@ import {
   buildArtifactBrowserViewModel,
   buildArtifactPreviewViewModel,
   buildDashboardFiltersViewModel,
+  buildDashboardSelectionViewModel,
   buildRunViewModel,
   filterApprovalsByStatus,
   filterRunEventsByLevel,
@@ -63,6 +64,8 @@ const dashboardFilterQuerySchema = z.object({
   taskState: taskStateSchema.optional(),
   approvalStatus: approvalStatusSchema.optional(),
   eventLevel: eventLevelSchema.optional(),
+  runLimit: z.number().int().positive().max(100).optional(),
+  runOffset: z.number().int().nonnegative().optional(),
 });
 
 function parsePageQuery(requestUrl: URL): z.infer<typeof pageQuerySchema> {
@@ -96,6 +99,8 @@ function parseDashboardFilterQuery(requestUrl: URL): z.infer<typeof dashboardFil
     taskState: taskStateValue ? taskStateSchema.parse(taskStateValue) : undefined,
     approvalStatus: approvalStatusValue ? approvalStatusSchema.parse(approvalStatusValue) : undefined,
     eventLevel: eventLevelValue ? eventLevelSchema.parse(eventLevelValue) : undefined,
+    runLimit: requestUrl.searchParams.get('runLimit') ? Number(requestUrl.searchParams.get('runLimit')) : undefined,
+    runOffset: requestUrl.searchParams.get('runOffset') ? Number(requestUrl.searchParams.get('runOffset')) : undefined,
   });
 }
 
@@ -187,6 +192,7 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
       const dashboardAsset = getDashboardAsset(requestUrl.pathname);
 
       if (request.method === 'GET' && dashboardAsset) {
+        response.setHeader('cache-control', 'no-store');
         sendText(response, 200, dashboardAsset.body, dashboardAsset.contentType);
         return;
       }
@@ -208,9 +214,13 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
       if (request.method === 'GET' && requestUrl.pathname === '/dashboard/state') {
         const taskId = requestUrl.searchParams.get('taskId');
         const filters = parseDashboardFilterQuery(requestUrl);
-        const tasks = filterTasksByState(runtime.listTasks(), filters.taskState);
+        const allTasks = runtime.listTasks();
+        const tasks = filterTasksByState(allTasks, filters.taskState);
         const approvals = filterApprovalsByStatus(runtime.listApprovals(), filters.approvalStatus);
-        const timeline = taskId ? runtime.getTaskTimeline(taskId, { limit: 20, offset: 0 }) : undefined;
+        const requestedTaskExists = taskId ? allTasks.some((task) => task.id === taskId) : false;
+        const timeline = taskId && requestedTaskExists
+          ? runtime.getTaskTimeline(taskId, { limit: filters.runLimit ?? 10, offset: filters.runOffset ?? 0 })
+          : undefined;
         sendJson(response, 200, {
           health: {
             status: 'ok',
@@ -218,6 +228,10 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
             autonomy: config.autonomy.mode,
           },
           filters: buildDashboardFiltersViewModel(filters),
+          selection: buildDashboardSelectionViewModel({
+            requestedTaskId: taskId ?? undefined,
+            requestedTaskExists,
+          }),
           tasks,
           approvals,
           targets: runtime.listTargets(),
@@ -289,7 +303,15 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
       if (request.method === 'GET' && requestUrl.pathname.startsWith('/tasks/')) {
         const taskId = requestUrl.pathname.split('/')[2];
         if (requestUrl.pathname.endsWith('/artifacts/browser')) {
-          sendJson(response, 200, buildArtifactBrowserViewModel(taskId, runtime.getTaskArtifacts(taskId)));
+          const page = parsePageQuery(requestUrl);
+          sendJson(
+            response,
+            200,
+            buildArtifactBrowserViewModel(taskId, runtime.getTaskArtifacts(taskId), {
+              limit: page.limit ?? 12,
+              offset: page.offset ?? 0,
+            }),
+          );
           return;
         }
         if (requestUrl.pathname.endsWith('/artifacts')) {

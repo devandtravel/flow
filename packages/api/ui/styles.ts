@@ -477,6 +477,12 @@ pre {
 
 .run-summary-card {
   min-height: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+
+.run-summary-card:hover {
+  border-color: rgba(98, 192, 255, 0.32);
 }
 
 .summary-title,
@@ -542,6 +548,11 @@ pre {
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--muted);
+}
+
+.pager {
+  justify-content: flex-start;
+  margin-bottom: 8px;
 }
 
 .split {

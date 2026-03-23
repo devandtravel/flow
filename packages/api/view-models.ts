@@ -73,6 +73,11 @@ export type ArtifactBrowserRunGroupViewModel = z.infer<typeof artifactBrowserRun
 
 export const artifactBrowserViewModelSchema = z.object({
   taskId: z.string().uuid(),
+  page: z.object({
+    total: z.number().int().nonnegative(),
+    limit: z.number().int().positive(),
+    offset: z.number().int().nonnegative(),
+  }),
   runs: z.array(artifactBrowserRunGroupViewModelSchema),
 });
 export type ArtifactBrowserViewModel = z.infer<typeof artifactBrowserViewModelSchema>;
@@ -112,6 +117,13 @@ export const dashboardFiltersViewModelSchema = z.object({
   eventLevel: z.string(),
 });
 export type DashboardFiltersViewModel = z.infer<typeof dashboardFiltersViewModelSchema>;
+
+export const dashboardSelectionViewModelSchema = z.object({
+  requestedTaskId: z.string(),
+  resolvedTaskId: z.string(),
+  requestedTaskMissing: z.boolean(),
+});
+export type DashboardSelectionViewModel = z.infer<typeof dashboardSelectionViewModelSchema>;
 
 function safeParseJson(content: string): unknown {
   try {
@@ -317,10 +329,15 @@ export function buildArtifactPreviewViewModel(artifact: TaskArtifactView): Artif
   });
 }
 
-export function buildArtifactBrowserViewModel(taskId: string, artifacts: TaskArtifactView[]): ArtifactBrowserViewModel {
+export function buildArtifactBrowserViewModel(
+  taskId: string,
+  artifacts: TaskArtifactView[],
+  page: { limit: number; offset: number },
+): ArtifactBrowserViewModel {
+  const pagedArtifacts = artifacts.slice(page.offset, page.offset + page.limit);
   const groupedRuns = new Map<string, Map<number, ArtifactBrowserStepGroupViewModel>>();
 
-  for (const artifact of artifacts) {
+  for (const artifact of pagedArtifacts) {
     if (!groupedRuns.has(artifact.runId)) {
       groupedRuns.set(artifact.runId, new Map<number, ArtifactBrowserStepGroupViewModel>());
     }
@@ -357,6 +374,11 @@ export function buildArtifactBrowserViewModel(taskId: string, artifacts: TaskArt
 
   return artifactBrowserViewModelSchema.parse({
     taskId,
+    page: {
+      total: artifacts.length,
+      limit: page.limit,
+      offset: page.offset,
+    },
     runs: [...groupedRuns.entries()].map((entry) =>
       artifactBrowserRunGroupViewModelSchema.parse({
         runId: entry[0],
@@ -433,6 +455,19 @@ export function buildDashboardFiltersViewModel(input: {
     taskState: input.taskState ?? '',
     approvalStatus: input.approvalStatus ?? '',
     eventLevel: input.eventLevel ?? '',
+  });
+}
+
+export function buildDashboardSelectionViewModel(input: {
+  requestedTaskId?: string;
+  requestedTaskExists: boolean;
+}): DashboardSelectionViewModel {
+  const requestedTaskId = input.requestedTaskId ?? '';
+  const resolvedTaskId = input.requestedTaskExists ? requestedTaskId : '';
+  return dashboardSelectionViewModelSchema.parse({
+    requestedTaskId,
+    resolvedTaskId,
+    requestedTaskMissing: requestedTaskId.length > 0 && !input.requestedTaskExists,
   });
 }
 
