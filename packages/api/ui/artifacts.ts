@@ -163,6 +163,46 @@ function renderPatchPreview(patch) {
   ].join('');
 }
 
+function renderArtifactFilterBar(artifactBrowser) {
+  if (!artifactBrowser || !Array.isArray(artifactBrowser.runs)) {
+    return '';
+  }
+
+  const runOptions = artifactBrowser.runs.map((runGroup) => ({
+    value: runGroup.runId,
+    label: runGroup.runId,
+  }));
+  const artifactTypes = [];
+
+  for (const runGroup of artifactBrowser.runs) {
+    if (!Array.isArray(runGroup.steps)) {
+      continue;
+    }
+    for (const stepGroup of runGroup.steps) {
+      if (!Array.isArray(stepGroup.artifacts)) {
+        continue;
+      }
+      for (const artifactItem of stepGroup.artifacts) {
+        const artifactType = artifactItem && artifactItem.artifact ? artifactItem.artifact.type : '';
+        if (typeof artifactType === 'string' && artifactType.length > 0 && !artifactTypes.includes(artifactType)) {
+          artifactTypes.push(artifactType);
+        }
+      }
+    }
+  }
+
+  return [
+    '<div class="filter-grid artifact-filter-grid">',
+    '<div class="field"><label>' + escapeHtml(copy.artifactRunFilter) + '</label><select data-filter="artifact-run">' +
+      renderSelectOptions([{ value: '', label: copy.allRuns }].concat(runOptions), state.artifactRunFilter) +
+    '</select></div>',
+    '<div class="field"><label>' + escapeHtml(copy.artifactTypeFilter) + '</label><select data-filter="artifact-type">' +
+      renderSelectOptions([{ value: '', label: copy.allArtifactTypes }].concat(artifactTypes.map((artifactType) => ({ value: artifactType, label: artifactType }))), state.artifactTypeFilter) +
+    '</select></div>',
+    '</div>',
+  ].join('');
+}
+
 function renderArtifacts(artifactBrowser, artifactContent) {
   const hasRuns = artifactBrowser && Array.isArray(artifactBrowser.runs) && artifactBrowser.runs.length > 0;
   const artifactList = !hasRuns
@@ -233,7 +273,7 @@ function renderArtifacts(artifactBrowser, artifactContent) {
 
   return [
     '<section class="split">',
-    '<section class="panel stack artifact-browser-panel"><div class="toolbar spread"><h2>Артефакты</h2>' + renderPill('task scope', '') + '</div>' + renderPager('artifacts', artifactBrowser ? artifactBrowser.page : null) + '<div class="list">' + artifactList + '</div></section>',
+    '<section class="panel stack artifact-browser-panel"><div class="toolbar spread"><div class="stack gap-xs"><h2>Артефакты</h2><div class="meta">Группировка по запускам и шагам.</div></div>' + renderPill(artifactBrowser && artifactBrowser.page ? String(artifactBrowser.page.total) : '0', '') + '</div>' + renderArtifactFilterBar(artifactBrowser) + renderPager('artifacts', artifactBrowser ? artifactBrowser.page : null) + '<div class="list">' + artifactList + '</div></section>',
     '<section class="stack artifact-preview-panel">' + artifactPreview + '</section>',
     '</section>',
   ].join('');

@@ -411,6 +411,50 @@ describe('API server', () => {
     expect(tasksJson).toEqual([]);
   });
 
+  it('stops a queued task and stops all queued tasks through the REST API', async () => {
+    const firstTaskResponse = await fetch(`${currentBaseUrl}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ goal: 'queued task one' }),
+    });
+    expect(firstTaskResponse.status).toBe(201);
+    const firstTaskJson = await firstTaskResponse.json();
+
+    const secondTaskResponse = await fetch(`${currentBaseUrl}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ goal: 'queued task two' }),
+    });
+    expect(secondTaskResponse.status).toBe(201);
+    const secondTaskJson = await secondTaskResponse.json();
+
+    const stopResponse = await fetch(`${currentBaseUrl}/tasks/${firstTaskJson.id}/stop`, {
+      method: 'POST',
+    });
+    expect(stopResponse.status).toBe(200);
+    const stoppedTaskJson = await stopResponse.json();
+    expect(stoppedTaskJson).toEqual(
+      expect.objectContaining({
+        id: firstTaskJson.id,
+        state: 'cancelled',
+      }),
+    );
+
+    const stopAllResponse = await fetch(`${currentBaseUrl}/tasks/stop-all`, {
+      method: 'POST',
+    });
+    expect(stopAllResponse.status).toBe(200);
+    const stopAllJson = await stopAllResponse.json();
+    expect(stopAllJson).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: secondTaskJson.id,
+          state: 'cancelled',
+        }),
+      ]),
+    );
+  });
+
   it('manages targets, schedules, and maintenance endpoints', async () => {
     const targetsResponse = await fetch(`${currentBaseUrl}/targets`);
     const targetsJson = await targetsResponse.json();

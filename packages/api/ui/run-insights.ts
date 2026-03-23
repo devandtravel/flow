@@ -94,13 +94,18 @@ function renderRunSummaryCard(runEntry) {
 function renderTaskHeader(taskView) {
   const latestRun = Array.isArray(taskView.runs) && taskView.runs.length > 0 ? taskView.runs[0] : null;
   const summary = taskView.summary && typeof taskView.summary === 'object' ? taskView.summary : null;
+  const stopButton = isTaskStoppable(taskView.task)
+    ? '<button type="button" class="button warning" data-task-stop-id="' + escapeHtml(taskView.task.id) + '">' + escapeHtml(copy.stopTask) + '</button>'
+    : '';
+  const deleteButton =
+    '<button type="button" class="button danger" data-task-delete-id="' + escapeHtml(taskView.task.id) + '">' + escapeHtml(copy.deleteTask) + '</button>';
 
   return [
     '<section class="panel stack task-header-panel">',
     '<div class="toolbar spread">',
     '<div class="stack gap-xs">',
     '<div class="eyebrow">' + escapeHtml(copy.selectedTask) + '</div>',
-    '<h2>' + escapeHtml(taskView.task.goal) + '</h2>',
+    '<h2 class="task-heading-clamp" title="' + escapeHtml(taskView.task.goal) + '">' + escapeHtml(taskView.task.goal) + '</h2>',
     '<div class="meta mono">' + escapeHtml(taskView.task.id) + '</div>',
     '</div>',
     renderPill(getStateLabel(taskView.task.state), getStateTone(taskView.task.state)),
@@ -118,6 +123,7 @@ function renderTaskHeader(taskView) {
       { label: 'runs', value: String(taskView.runsPage.total) },
       { label: 'approvals', value: String(Array.isArray(taskView.approvals) ? taskView.approvals.length : 0) },
     ]),
+    '<div class="toolbar">' + stopButton + deleteButton + '</div>',
     renderTaskActions(taskView.actions, taskView.task.id),
     latestRun ? renderPlanPreviewBlock(latestRun.summary) : '',
     latestRun ? renderCriticFeedbackBlock(latestRun.summary) : '',

@@ -76,14 +76,39 @@ describe('AgentRuntime', () => {
     expect(existsSync(artifactRunDir)).toBe(false);
   });
 
-  it('refuses to delete all tasks while at least one task is not in a deletable state', async () => {
+  it('requests stop-and-delete for an active task and removes it after the next safe checkpoint', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-stop-delete-active-'));
+    const config = buildDefaultConfig(workspaceRoot, 'project');
+    config.autonomy.mode = 'autonomous';
+
+    const runtime = new AgentRuntime({
+      workspaceRoot,
+      config,
+      provider: new DelayedMockProvider(300),
+    });
+    const task = runtime.createTask('write project output');
+
+    const runPromise = runtime.runTask(task.id);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    const deletion = runtime.deleteTask(task.id);
+    const summary = await runPromise;
+
+    expect(deletion.deletedCounts.tasks).toBe(0);
+    expect(summary.state).toBe('cancelled');
+    expect(runtime.listTasks()).toHaveLength(0);
+  });
+
+  it('stop-and-delete all tasks, including queued tasks, through the bulk deletion path', async () => {
     const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-delete-all-guard-'));
     const config = buildDefaultConfig(workspaceRoot, 'project');
     config.llm.provider = 'mock';
     const runtime = new AgentRuntime({ workspaceRoot, config });
-    runtime.createTask('queued task');
-
-    expect(() => runtime.deleteAllTasks()).toThrow(/Delete-all is allowed only when all tasks are in deletable states/);
+    const task = runtime.createTask('queued task');
+    const deletion = runtime.deleteAllTasks();
+    expect(deletion.deletedTaskIds).toEqual([task.id]);
+    expect(deletion.pendingTaskIds).toEqual([]);
   });
 
   it('salvages a read-only observation prefix and completes after replanning with exact snapshots', async () => {

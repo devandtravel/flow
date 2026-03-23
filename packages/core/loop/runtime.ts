@@ -98,6 +98,7 @@ export interface DeletedTaskSummary {
 
 export interface DeletedTasksSummary {
   deletedTaskIds: string[];
+  pendingTaskIds: string[];
   deletedCounts: {
     approvals: number;
     artifacts: number;
@@ -180,6 +181,12 @@ export type RuntimeUpdateEvent =
       kind: 'task_deleted';
       timestamp: string;
       taskId: string;
+    }
+  | {
+      kind: 'task_stop_requested';
+      timestamp: string;
+      taskId: string;
+      deleteAfterStop: boolean;
     }
   | {
       kind: 'run_changed';
@@ -322,6 +329,10 @@ function isTaskDeletionAllowedState(state: TaskRecord['state']): boolean {
   return ['completed', 'failed', 'blocked', 'cancelled', 'rolled_back', 'escalated'].includes(state);
 }
 
+function isTaskStoppableState(state: TaskRecord['state']): boolean {
+  return ['queued', 'planning', 'validating', 'executing', 'awaiting_approval', 'verifying', 'retryable'].includes(state);
+}
+
 export class AgentRuntime {
   readonly workspaceRoot: string;
   readonly config: RuntimeConfig;
@@ -340,6 +351,8 @@ export class AgentRuntime {
   private readonly artifactsDir: string;
   private readonly changedFilesByRun = new Map<string, Set<string>>();
   private readonly subscribers = new Set<(event: RuntimeUpdateEvent) => void>();
+  private readonly stopRequestedTaskIds = new Set<string>();
+  private readonly deleteAfterStopTaskIds = new Set<string>();
 
   constructor(options: RuntimeOptions) {
     this.workspaceRoot = options.workspaceRoot;
@@ -580,25 +593,130 @@ export class AgentRuntime {
       .some((event) => event.message === 'plan_invalid' || event.message === 'plan_generation_failed');
   }
 
-  private ensureTaskDeletionAllowed(task: TaskRecord): void {
-    if (isTaskDeletionAllowedState(task.state)) {
-      return;
-    }
-
-    throw new InvalidOperationError(
-      `Task ${task.id} cannot be deleted while it is in state ${task.state}. Cancel or finish the task first.`,
-      {
-        taskId: task.id,
-        state: task.state,
-      },
-    );
-  }
-
   private removeDeletedTaskArtifacts(taskDeletion: DatabaseTaskDeletionSummary): void {
     for (const runId of taskDeletion.runIds) {
       rmSync(path.join(this.artifactsDir, runId), { recursive: true, force: true });
       this.changedFilesByRun.delete(runId);
     }
+  }
+
+  private isStopRequested(taskId: string): boolean {
+    return this.stopRequestedTaskIds.has(taskId);
+  }
+
+  private isDeleteAfterStopRequested(taskId: string): boolean {
+    return this.deleteAfterStopTaskIds.has(taskId);
+  }
+
+  private clearTaskStopRequests(taskId: string): void {
+    this.stopRequestedTaskIds.delete(taskId);
+    this.deleteAfterStopTaskIds.delete(taskId);
+  }
+
+  private rejectPendingApprovalsForTask(taskId: string): void {
+    for (const approval of this.database.listApprovalsByTask(taskId)) {
+      if (approval.status !== 'pending') {
+        continue;
+      }
+
+      const updated = this.database.updateApprovalStatus(approval.id, 'rejected');
+      this.emitRuntimeUpdate({
+        kind: 'approval_changed',
+        taskId: updated.task_id,
+        runId: updated.run_id,
+        approvalId: updated.id,
+        status: updated.status,
+      });
+    }
+  }
+
+  private requestTaskStopInternal(taskId: string, deleteAfterStop: boolean): TaskRecord {
+    const task = this.requireTask(taskId);
+    if (!isTaskStoppableState(task.state)) {
+      return task;
+    }
+
+    this.stopRequestedTaskIds.add(taskId);
+    if (deleteAfterStop) {
+      this.deleteAfterStopTaskIds.add(taskId);
+    }
+    this.emitRuntimeUpdate({
+      kind: 'task_stop_requested',
+      taskId,
+      deleteAfterStop,
+    });
+
+    if (task.state === 'queued' || task.state === 'retryable' || task.state === 'awaiting_approval') {
+      const latestRun = this.getLatestRunForTask(taskId);
+      if (latestRun && latestRun.status === 'awaiting_approval') {
+        this.finishRun(latestRun, 'cancelled');
+      }
+      this.rejectPendingApprovalsForTask(taskId);
+      const cancelledTask = this.transitionTask(task, 'cancelled');
+      return cancelledTask;
+    }
+
+    return task;
+  }
+
+  private finalizeTaskCancellation(task: TaskRecord, run: RunRecord | undefined, reason: string): TaskRecord {
+    if (run && !['completed', 'failed', 'cancelled', 'escalated'].includes(run.status)) {
+      this.createRunEvent(task.id, run.id, 'warning', 'task_stopped', {
+        reason,
+        deleteAfterStop: this.isDeleteAfterStopRequested(task.id),
+      });
+      this.finishRun(run, 'cancelled');
+    }
+    this.rejectPendingApprovalsForTask(task.id);
+    const refreshedTask = this.database.getTask(task.id) ?? task;
+    const cancelledTask = refreshedTask.state === 'cancelled' ? refreshedTask : this.transitionTask(refreshedTask, 'cancelled');
+    return cancelledTask;
+  }
+
+  private applyStopRequestIfNeeded(
+    task: TaskRecord,
+    run: RunRecord | undefined,
+    reason: string,
+  ): { task: TaskRecord; deleted: boolean } | undefined {
+    if (!this.isStopRequested(task.id)) {
+      return undefined;
+    }
+
+    const cancelledTask = this.finalizeTaskCancellation(task, run, reason);
+    const shouldDelete = this.isDeleteAfterStopRequested(task.id);
+    if (shouldDelete) {
+      this.deleteTaskImmediately(task.id);
+    } else {
+      this.clearTaskStopRequests(task.id);
+    }
+
+    return {
+      task: cancelledTask,
+      deleted: shouldDelete,
+    };
+  }
+
+  private deleteTaskImmediately(taskId: string): DeletedTaskSummary {
+    const deletion = this.database.deleteTaskCascade(taskId);
+    this.removeDeletedTaskArtifacts(deletion);
+    this.clearTaskStopRequests(taskId);
+    this.emitRuntimeUpdate({
+      kind: 'task_deleted',
+      taskId,
+    });
+    return {
+      taskId,
+      deletedCounts: {
+        approvals: deletion.deletedCounts.approvals,
+        artifacts: deletion.deletedCounts.artifacts,
+        evaluations: deletion.deletedCounts.evaluations,
+        memoryEntries: deletion.deletedCounts.memoryEntries,
+        runEvents: deletion.deletedCounts.runEvents,
+        runs: deletion.deletedCounts.runs,
+        steps: deletion.deletedCounts.steps,
+        tasks: deletion.deletedCounts.task,
+      },
+    };
   }
 
   private recordTaskOperatorAction(
@@ -974,41 +1092,46 @@ export class AgentRuntime {
     return this.database.listTasks();
   }
 
+  stopTask(taskId: string): TaskRecord {
+    return this.requestTaskStopInternal(taskId, false);
+  }
+
+  stopAllTasks(): TaskRecord[] {
+    return this.listTasks()
+      .filter((task) => isTaskStoppableState(task.state))
+      .map((task) => this.requestTaskStopInternal(task.id, false));
+  }
+
   deleteTask(taskId: string): DeletedTaskSummary {
     const task = this.requireTask(taskId);
-    this.ensureTaskDeletionAllowed(task);
-    const deletion = this.database.deleteTaskCascade(taskId);
-    this.removeDeletedTaskArtifacts(deletion);
-    this.emitRuntimeUpdate({
-      kind: 'task_deleted',
-      taskId,
-    });
+    if (isTaskDeletionAllowedState(task.state)) {
+      return this.deleteTaskImmediately(taskId);
+    }
+
+    const stoppedTask = this.requestTaskStopInternal(taskId, true);
+    if (isTaskDeletionAllowedState(stoppedTask.state)) {
+      return this.deleteTaskImmediately(taskId);
+    }
+
     return {
       taskId,
       deletedCounts: {
-        approvals: deletion.deletedCounts.approvals,
-        artifacts: deletion.deletedCounts.artifacts,
-        evaluations: deletion.deletedCounts.evaluations,
-        memoryEntries: deletion.deletedCounts.memoryEntries,
-        runEvents: deletion.deletedCounts.runEvents,
-        runs: deletion.deletedCounts.runs,
-        steps: deletion.deletedCounts.steps,
-        tasks: deletion.deletedCounts.task,
+        approvals: 0,
+        artifacts: 0,
+        evaluations: 0,
+        memoryEntries: 0,
+        runEvents: 0,
+        runs: 0,
+        steps: 0,
+        tasks: 0,
       },
     };
   }
 
   deleteAllTasks(): DeletedTasksSummary {
     const tasks = this.listTasks();
-    const blockedTasks = tasks.filter((task) => !isTaskDeletionAllowedState(task.state));
-    if (blockedTasks.length > 0) {
-      throw new InvalidOperationError('Delete-all is allowed only when all tasks are in deletable states.', {
-        blockedTaskIds: blockedTasks.map((task) => task.id),
-        blockedStates: blockedTasks.map((task) => task.state),
-      });
-    }
-
     const deletedTaskIds: string[] = [];
+    const pendingTaskIds: string[] = [];
     const deletedCounts = {
       approvals: 0,
       artifacts: 0,
@@ -1021,25 +1144,40 @@ export class AgentRuntime {
     };
 
     for (const task of tasks) {
-      const deletion = this.database.deleteTaskCascade(task.id);
-      this.removeDeletedTaskArtifacts(deletion);
-      deletedTaskIds.push(task.id);
-      deletedCounts.approvals += deletion.deletedCounts.approvals;
-      deletedCounts.artifacts += deletion.deletedCounts.artifacts;
-      deletedCounts.evaluations += deletion.deletedCounts.evaluations;
-      deletedCounts.memoryEntries += deletion.deletedCounts.memoryEntries;
-      deletedCounts.runEvents += deletion.deletedCounts.runEvents;
-      deletedCounts.runs += deletion.deletedCounts.runs;
-      deletedCounts.steps += deletion.deletedCounts.steps;
-      deletedCounts.tasks += deletion.deletedCounts.task;
-      this.emitRuntimeUpdate({
-        kind: 'task_deleted',
-        taskId: task.id,
-      });
+      if (isTaskDeletionAllowedState(task.state)) {
+        const deletion = this.deleteTaskImmediately(task.id);
+        deletedTaskIds.push(task.id);
+        deletedCounts.approvals += deletion.deletedCounts.approvals;
+        deletedCounts.artifacts += deletion.deletedCounts.artifacts;
+        deletedCounts.evaluations += deletion.deletedCounts.evaluations;
+        deletedCounts.memoryEntries += deletion.deletedCounts.memoryEntries;
+        deletedCounts.runEvents += deletion.deletedCounts.runEvents;
+        deletedCounts.runs += deletion.deletedCounts.runs;
+        deletedCounts.steps += deletion.deletedCounts.steps;
+        deletedCounts.tasks += deletion.deletedCounts.tasks;
+        continue;
+      }
+
+      const stoppedTask = this.requestTaskStopInternal(task.id, true);
+      if (isTaskDeletionAllowedState(stoppedTask.state)) {
+        const deletion = this.deleteTaskImmediately(task.id);
+        deletedTaskIds.push(task.id);
+        deletedCounts.approvals += deletion.deletedCounts.approvals;
+        deletedCounts.artifacts += deletion.deletedCounts.artifacts;
+        deletedCounts.evaluations += deletion.deletedCounts.evaluations;
+        deletedCounts.memoryEntries += deletion.deletedCounts.memoryEntries;
+        deletedCounts.runEvents += deletion.deletedCounts.runEvents;
+        deletedCounts.runs += deletion.deletedCounts.runs;
+        deletedCounts.steps += deletion.deletedCounts.steps;
+        deletedCounts.tasks += deletion.deletedCounts.tasks;
+      } else {
+        pendingTaskIds.push(task.id);
+      }
     }
 
     return {
       deletedTaskIds,
+      pendingTaskIds,
       deletedCounts,
     };
   }
@@ -1580,10 +1718,35 @@ export class AgentRuntime {
       });
       this.createRunEvent(task.id, run.id, 'info', 'planning_started', { taskId: task.id, targetId: task.target_id });
 
+      const stopBeforePlanning = this.applyStopRequestIfNeeded(task, run, 'Остановка выполнена до построения плана.');
+      if (stopBeforePlanning) {
+        return {
+          task: stopBeforePlanning.task,
+          runId: run.id,
+          state: stopBeforePlanning.task.state,
+          plan: lastPlan,
+          artifacts: createdArtifacts,
+          approvals: createdApprovals,
+          metrics: this.metrics.snapshot(),
+        };
+      }
+
       const planSource = await this.resolveApprovedStep(task);
       if (!planSource.approval) {
         try {
           lastPlan = await this.planTask(task, target);
+          const stopAfterPlanning = this.applyStopRequestIfNeeded(task, this.database.getRun(run.id) ?? run, 'Остановка выполнена после построения плана.');
+          if (stopAfterPlanning) {
+            return {
+              task: stopAfterPlanning.task,
+              runId: run.id,
+              state: stopAfterPlanning.task.state,
+              plan: lastPlan,
+              artifacts: createdArtifacts,
+              approvals: createdApprovals,
+              metrics: this.metrics.snapshot(),
+            };
+          }
           const availableTools = listToolDefinitions(this.tools).filter((tool) => target.capabilities.includes(tool.capability));
           this.createRunEvent(task.id, run.id, 'info', 'planning_completed', {
             stepCount: lastPlan.steps.length,
@@ -1631,6 +1794,18 @@ export class AgentRuntime {
             break;
           }
         } catch (error) {
+          const stopAfterPlanningFailure = this.applyStopRequestIfNeeded(task, this.database.getRun(run.id) ?? run, 'Остановка выполнена после завершения planning.');
+          if (stopAfterPlanningFailure) {
+            return {
+              task: stopAfterPlanningFailure.task,
+              runId: run.id,
+              state: stopAfterPlanningFailure.task.state,
+              plan: lastPlan,
+              artifacts: createdArtifacts,
+              approvals: createdApprovals,
+              metrics: this.metrics.snapshot(),
+            };
+          }
           const failureMessage = error instanceof Error ? error.message : 'Plan generation failed.';
           this.metrics.recordFailure('plan_generation');
           this.memory.recordFailure(`plan:${run.id}`, { reason: failureMessage });
@@ -1682,11 +1857,37 @@ export class AgentRuntime {
       this.transitionRun(this.database.getRun(run.id) ?? run, 'executing');
       executionStartedAt = Date.now();
 
+      const stopBeforeExecution = this.applyStopRequestIfNeeded(task, this.database.getRun(run.id) ?? run, 'Остановка выполнена до запуска шагов.');
+      if (stopBeforeExecution) {
+        return {
+          task: stopBeforeExecution.task,
+          runId: run.id,
+          state: stopBeforeExecution.task.state,
+          plan: lastPlan,
+          artifacts: createdArtifacts,
+          approvals: createdApprovals,
+          metrics: this.metrics.snapshot(),
+        };
+      }
+
       let hadFailure = false;
       let verifiedSteps = 0;
       const failures: string[] = [];
 
       for (const [index, step] of lastPlan.steps.entries()) {
+        const stopBeforeStep = this.applyStopRequestIfNeeded(task, this.database.getRun(run.id) ?? run, `Остановка выполнена перед шагом ${String(index + 1)}.`);
+        if (stopBeforeStep) {
+          return {
+            task: stopBeforeStep.task,
+            runId: run.id,
+            state: stopBeforeStep.task.state,
+            plan: lastPlan,
+            artifacts: createdArtifacts,
+            approvals: createdApprovals,
+            metrics: this.metrics.snapshot(),
+          };
+        }
+
         const tool = this.tools.get(step.tool);
         if (!tool) {
           hadFailure = true;
@@ -1826,6 +2027,18 @@ export class AgentRuntime {
         if (verification.verified) {
           verifiedSteps += 1;
           this.recordVerifiedStepMemory(task, run, completedStep, step, result);
+          const stopAfterStep = this.applyStopRequestIfNeeded(task, this.database.getRun(run.id) ?? run, `Остановка выполнена после шага ${String(index + 1)}.`);
+          if (stopAfterStep) {
+            return {
+              task: stopAfterStep.task,
+              runId: run.id,
+              state: stopAfterStep.task.state,
+              plan: lastPlan,
+              artifacts: createdArtifacts,
+              approvals: createdApprovals,
+              metrics: this.metrics.snapshot(),
+            };
+          }
         } else {
           hadFailure = true;
           failures.push(verification.evidence);
@@ -1839,6 +2052,18 @@ export class AgentRuntime {
 
       task = this.transitionTask(task, 'verifying');
       this.transitionRun(this.database.getRun(run.id) ?? run, 'verifying');
+      const stopBeforeEvaluation = this.applyStopRequestIfNeeded(task, this.database.getRun(run.id) ?? run, 'Остановка выполнена перед итоговой оценкой.');
+      if (stopBeforeEvaluation) {
+        return {
+          task: stopBeforeEvaluation.task,
+          runId: run.id,
+          state: stopBeforeEvaluation.task.state,
+          plan: lastPlan,
+          artifacts: createdArtifacts,
+          approvals: createdApprovals,
+          metrics: this.metrics.snapshot(),
+        };
+      }
       const evaluation = await this.evaluator.evaluate({
         totalSteps: lastPlan.steps.length,
         verifiedSteps,
@@ -1850,6 +2075,19 @@ export class AgentRuntime {
         failures,
         target_id: task.target_id,
       });
+
+      const stopBeforeFinalization = this.applyStopRequestIfNeeded(task, this.database.getRun(run.id) ?? run, 'Остановка выполнена после оценки результата.');
+      if (stopBeforeFinalization) {
+        return {
+          task: stopBeforeFinalization.task,
+          runId: run.id,
+          state: stopBeforeFinalization.task.state,
+          plan: lastPlan,
+          artifacts: createdArtifacts,
+          approvals: createdApprovals,
+          metrics: this.metrics.snapshot(),
+        };
+      }
 
       if (hadFailure) {
         this.metrics.recordFailure(failures[0] ?? 'execution_failure');

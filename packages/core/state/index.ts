@@ -3,11 +3,11 @@ import { InvalidOperationError } from '../../errors';
 
 const taskTransitions: Record<TaskState, TaskState[]> = {
   queued: ['planning', 'cancelled'],
-  planning: ['validating', 'failed', 'blocked'],
-  validating: ['executing', 'awaiting_approval', 'failed', 'blocked'],
-  executing: ['verifying', 'awaiting_approval', 'failed', 'blocked'],
+  planning: ['validating', 'failed', 'blocked', 'cancelled'],
+  validating: ['executing', 'awaiting_approval', 'failed', 'blocked', 'cancelled'],
+  executing: ['verifying', 'awaiting_approval', 'failed', 'blocked', 'cancelled'],
   awaiting_approval: ['queued', 'cancelled', 'blocked'],
-  verifying: ['completed', 'failed', 'retryable', 'rolled_back', 'escalated'],
+  verifying: ['completed', 'failed', 'retryable', 'rolled_back', 'escalated', 'cancelled'],
   completed: [],
   failed: ['queued', 'retryable', 'escalated', 'rolled_back', 'cancelled'],
   retryable: ['queued', 'planning', 'escalated', 'cancelled'],
@@ -19,11 +19,11 @@ const taskTransitions: Record<TaskState, TaskState[]> = {
 
 const runTransitions: Record<RunState, RunState[]> = {
   queued: ['planning', 'cancelled'],
-  planning: ['validating', 'failed'],
-  validating: ['executing', 'awaiting_approval', 'failed'],
-  executing: ['verifying', 'awaiting_approval', 'failed'],
+  planning: ['validating', 'failed', 'cancelled'],
+  validating: ['executing', 'awaiting_approval', 'failed', 'cancelled'],
+  executing: ['verifying', 'awaiting_approval', 'failed', 'cancelled'],
   awaiting_approval: ['queued', 'cancelled'],
-  verifying: ['completed', 'failed', 'escalated'],
+  verifying: ['completed', 'failed', 'escalated', 'cancelled'],
   completed: [],
   failed: ['queued', 'escalated', 'cancelled'],
   cancelled: [],
@@ -32,7 +32,7 @@ const runTransitions: Record<RunState, RunState[]> = {
 
 const stepTransitions: Record<StepState, StepState[]> = {
   queued: ['started', 'awaiting_approval', 'blocked', 'cancelled'],
-  started: ['completed', 'failed', 'awaiting_approval'],
+  started: ['completed', 'failed', 'awaiting_approval', 'cancelled'],
   awaiting_approval: ['queued', 'cancelled'],
   completed: [],
   failed: [],

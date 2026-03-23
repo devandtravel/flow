@@ -14,11 +14,12 @@ const storageKeys = {
   selectedRunId: 'flow.ui.selectedRunId',
   selectedArtifactId: 'flow.ui.selectedArtifactId',
   activeView: 'flow.ui.activeView',
-  compactMode: 'flow.ui.compactMode',
   pollingPaused: 'flow.ui.pollingPaused',
   taskFilter: 'flow.ui.taskFilter',
   eventLevelFilter: 'flow.ui.eventLevelFilter',
   approvalFilter: 'flow.ui.approvalFilter',
+  artifactRunFilter: 'flow.ui.artifactRunFilter',
+  artifactTypeFilter: 'flow.ui.artifactTypeFilter',
 };
 
 const state = {
@@ -31,7 +32,7 @@ const state = {
   refreshInFlight: false,
   shellReady: false,
   activeView: 'overview',
-  compactMode: false,
+  compactMode: true,
   lastUpdatedAt: '',
   lastError: '',
   streamConnected: false,
@@ -39,6 +40,8 @@ const state = {
   taskFilter: '',
   eventLevelFilter: '',
   approvalFilter: '',
+  artifactRunFilter: '',
+  artifactTypeFilter: '',
   taskRunCursor: '',
   runEventCursor: '',
   artifactCursor: '',
@@ -453,6 +456,15 @@ function isTaskDeletable(task) {
   return task && ['completed', 'failed', 'blocked', 'cancelled', 'rolled_back', 'escalated'].includes(task.state);
 }
 
+function isTaskStoppable(task) {
+  return task && ['queued', 'planning', 'validating', 'executing', 'awaiting_approval', 'verifying', 'retryable'].includes(task.state);
+}
+
+function renderTaskGoal(value) {
+  const text = typeof value === 'string' ? value : '';
+  return '<span class="task-goal-clamp" title="' + escapeHtml(text) + '">' + escapeHtml(text) + '</span>';
+}
+
 function normalizeChangedFiles(value) {
   if (!Array.isArray(value)) {
     return [];
@@ -789,15 +801,16 @@ function renderTasks(tasks) {
   return filteredTasks
     .map((task) => {
       const selected = task.id === state.selectedTaskId ? ' selected' : '';
-      const deleteButton = isTaskDeletable(task)
-        ? '<button type="button" class="button danger task-delete-button" data-task-delete-id="' + escapeHtml(task.id) + '">' + escapeHtml(copy.deleteTask) + '</button>'
+      const stopButton = isTaskStoppable(task)
+        ? '<button type="button" class="button warning task-stop-button" data-task-stop-id="' + escapeHtml(task.id) + '">' + escapeHtml(copy.stopTask) + '</button>'
         : '';
+      const deleteButton = '<button type="button" class="button danger task-delete-button" data-task-delete-id="' + escapeHtml(task.id) + '">' + escapeHtml(copy.deleteTask) + '</button>';
       return [
         '<article class="card task-card' + selected + '">',
         '<button type="button" class="task-card-main" data-task-id="' + escapeHtml(task.id) + '">',
         '<div class="card-title">',
         '<div class="stack gap-xs task-card-copy">',
-        '<strong>' + escapeHtml(task.goal) + '</strong>',
+        '<strong>' + renderTaskGoal(task.goal) + '</strong>',
         '<div class="meta mono">' + escapeHtml(task.id) + '</div>',
         '</div>',
         renderPill(getStateLabel(task.state), getStateTone(task.state)),
@@ -805,7 +818,7 @@ function renderTasks(tasks) {
         '<div class="meta">target: ' + escapeHtml(task.target_id) + '</div>',
         '<div class="meta">' + escapeHtml(formatRelativeTime(task.updated_at)) + '</div>',
         '</button>',
-        deleteButton ? '<div class="task-card-actions">' + deleteButton + '</div>' : '',
+        '<div class="task-card-actions">' + stopButton + deleteButton + '</div>',
         '</article>',
       ].join('');
     })
@@ -1041,11 +1054,10 @@ function renderShell() {
     '<div class="toolbar spread">',
     '<div class="stack hero-copy">',
     '<div class="eyebrow">' + escapeHtml(copy.runtime) + '</div>',
-    '<h2>Управление runtime</h2>',
-    '<div id="statusDetail" class="meta">' + escapeHtml(copy.dashboardReady) + '</div>',
+    '<h2>' + escapeHtml(copy.heroTitle) + '</h2>',
+    '<div id="statusDetail" class="meta">' + escapeHtml(copy.heroSubtitle) + '</div>',
     '</div>',
     '<div class="toolbar">',
-    '<button id="compactModeButton" type="button" class="button secondary"></button>',
     '<button id="pollingToggleButton" type="button" class="button ghost"></button>',
     '<span id="runtimeHealth"></span>',
     '</div>',
@@ -1113,11 +1125,26 @@ function bindShellEvents() {
       return;
     }
 
+    const stopAllTasksNode = event.target.closest('[data-stop-all-tasks]');
+    if (stopAllTasksNode instanceof HTMLElement) {
+      void stopAllTasks();
+      return;
+    }
+
     const deleteTaskNode = event.target.closest('[data-task-delete-id]');
     if (deleteTaskNode instanceof HTMLElement) {
       const taskId = deleteTaskNode.getAttribute('data-task-delete-id');
       if (taskId) {
         void deleteTask(taskId);
+      }
+      return;
+    }
+
+    const stopTaskNode = event.target.closest('[data-task-stop-id]');
+    if (stopTaskNode instanceof HTMLElement) {
+      const taskId = stopTaskNode.getAttribute('data-task-stop-id');
+      if (taskId) {
+        void stopTask(taskId);
       }
       return;
     }
@@ -1239,6 +1266,14 @@ function bindShellEvents() {
       if (filterType === 'approval-status') {
         state.approvalFilter = filterNode.value;
       }
+      if (filterType === 'artifact-run') {
+        state.artifactRunFilter = filterNode.value;
+        state.artifactCursor = '';
+      }
+      if (filterType === 'artifact-type') {
+        state.artifactTypeFilter = filterNode.value;
+        state.artifactCursor = '';
+      }
     persistUiState();
     if (state.lastLoadedData) {
       updateViewContent(state.lastLoadedData);
@@ -1262,15 +1297,6 @@ function bindShellEvents() {
     });
   }
 
-  const compactModeButton = getElement('compactModeButton');
-  if (compactModeButton instanceof HTMLButtonElement) {
-    compactModeButton.addEventListener('click', () => {
-      state.compactMode = !state.compactMode;
-      persistUiState('replace');
-      applyDensityMode();
-      updateCompactModeUi();
-    });
-  }
 }
 
 async function submitTask(goalInput, targetSelect) {
@@ -1401,6 +1427,44 @@ async function deleteAllTasks() {
   }
 }
 
+async function stopTask(taskId) {
+  if (!window.confirm(copy.stopTaskConfirm)) {
+    return;
+  }
+
+  state.lastError = '';
+  updateNotification();
+  try {
+    await fetchJson('/tasks/' + encodeURIComponent(taskId) + '/stop', {
+      method: 'POST',
+    });
+  } catch (error) {
+    state.lastError = error instanceof Error ? error.message : 'Не удалось остановить задачу.';
+  } finally {
+    updateNotification();
+    await refreshDashboard({ showLoading: false, force: true });
+  }
+}
+
+async function stopAllTasks() {
+  if (!window.confirm(copy.stopAllTasksConfirm)) {
+    return;
+  }
+
+  state.lastError = '';
+  updateNotification();
+  try {
+    await fetchJson('/tasks/stop-all', {
+      method: 'POST',
+    });
+  } catch (error) {
+    state.lastError = error instanceof Error ? error.message : 'Не удалось остановить задачи.';
+  } finally {
+    updateNotification();
+    await refreshDashboard({ showLoading: false, force: true });
+  }
+}
+
 function updatePollingUi() {
   const pollingToggleButton = document.getElementById('pollingToggleButton');
   if (pollingToggleButton instanceof HTMLButtonElement) {
@@ -1411,14 +1475,7 @@ function updatePollingUi() {
 }
 
 function applyDensityMode() {
-  document.body.classList.toggle('compact', state.compactMode);
-}
-
-function updateCompactModeUi() {
-  const compactModeButton = document.getElementById('compactModeButton');
-  if (compactModeButton instanceof HTMLButtonElement) {
-    compactModeButton.textContent = state.compactMode ? copy.disableCompact : copy.enableCompact;
-  }
+  document.body.classList.add('compact');
 }
 
 function setBusyState() {
@@ -1466,7 +1523,7 @@ function updateStatusBar(tasks, health) {
     selectedTask ? renderPill(getStateLabel(selectedTask.state), getStateTone(selectedTask.state)) : renderPill('None', ''),
   );
   setText('statusLastUpdated', state.lastUpdatedAt ? formatRelativeTime(state.lastUpdatedAt) : 'waiting');
-  setText('statusDetail', taskState.detail);
+  setText('statusDetail', copy.heroSubtitle);
 }
 
 function updateTabs() {
@@ -1605,6 +1662,12 @@ async function loadDashboardData() {
     if (state.artifactCursor) {
       artifactQuery.set('cursor', state.artifactCursor);
     }
+    if (state.artifactRunFilter) {
+      artifactQuery.set('runId', state.artifactRunFilter);
+    }
+    if (state.artifactTypeFilter) {
+      artifactQuery.set('artifactType', state.artifactTypeFilter);
+    }
     artifactBrowser = await fetchJson('/tasks/' + encodeURIComponent(effectiveSelectedTaskId) + '/artifacts/browser?' + artifactQuery.toString());
     const artifactItems =
       artifactBrowser && Array.isArray(artifactBrowser.runs)
@@ -1666,7 +1729,6 @@ function updateViewContent(loadedData) {
   updateStatusBar(tasks, health);
   updateTabs();
   updatePollingUi();
-  updateCompactModeUi();
   updateNotification();
 
   setText('kpiMode', String(health.mode));

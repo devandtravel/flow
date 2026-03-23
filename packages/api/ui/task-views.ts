@@ -25,8 +25,8 @@ function renderRun(run) {
 }
 
 function renderOverview(taskView, maintenance, metrics, tasks) {
-  const deletableTaskCount = Array.isArray(tasks) ? tasks.filter(isTaskDeletable).length : 0;
-  const allTasksDeletable = Array.isArray(tasks) && tasks.length > 0 && deletableTaskCount === tasks.length;
+  const hasTasks = Array.isArray(tasks) && tasks.length > 0;
+  const hasStoppableTasks = Array.isArray(tasks) && tasks.some(isTaskStoppable);
   const overviewBody = !taskView || !taskView.task
     ? '<section class="panel stack"><div class="empty">' + escapeHtml(copy.noTaskSelected) + '</div></section>'
     : [
@@ -42,11 +42,10 @@ function renderOverview(taskView, maintenance, metrics, tasks) {
 
   return [
     '<section class="split">',
-    '<section class="panel stack"><div class="toolbar spread"><div class="stack gap-xs"><h2>' + escapeHtml(copy.tasks) + '</h2><div class="meta">' + escapeHtml(copy.taskDeletionPolicy) + '</div></div><div class="toolbar">' +
+    '<section class="panel stack"><div class="toolbar spread"><div class="stack gap-xs"><h2>' + escapeHtml(copy.tasks) + '</h2></div><div class="toolbar">' +
       renderPill(String(Array.isArray(tasks) ? tasks.length : 0), '') +
-      '<button type="button" class="button danger" data-delete-all-tasks="true"' + (allTasksDeletable ? '' : ' disabled') + '>' +
-      escapeHtml(allTasksDeletable ? copy.deleteAllTasks : copy.deleteAllTasksUnavailable) +
-      '</button></div></div><div id="tasksList" class="list"></div></section>',
+      '<button type="button" class="button warning" data-stop-all-tasks="true"' + (hasStoppableTasks ? '' : ' disabled') + '>' + escapeHtml(copy.stopAllTasks) + '</button>' +
+      '<button type="button" class="button danger" data-delete-all-tasks="true"' + (hasTasks ? '' : ' disabled') + '>' + escapeHtml(copy.deleteAllTasks) + '</button></div></div><div id="tasksList" class="list"></div></section>',
     '<section class="stack">' + overviewBody + '</section>',
     '</section>',
     renderFilterBar(),
@@ -62,13 +61,19 @@ function renderRunPage(runView) {
     return '<section class="panel stack"><div class="empty">Выберите запуск для просмотра.</div></section>';
   }
 
+  const stopButton = isTaskStoppable(runView.task)
+    ? '<button type="button" class="button warning" data-task-stop-id="' + escapeHtml(runView.task.id) + '">' + escapeHtml(copy.stopTask) + '</button>'
+    : '';
+  const deleteButton =
+    '<button type="button" class="button danger" data-task-delete-id="' + escapeHtml(runView.task.id) + '">' + escapeHtml(copy.deleteTask) + '</button>';
+
   return [
     '<section class="stack run-view-panel">',
     '<section class="panel stack task-header-panel">',
     '<div class="toolbar spread">',
     '<div class="stack gap-xs">',
     '<div class="eyebrow">Запуск</div>',
-    '<h2>' + escapeHtml(runView.task.goal) + '</h2>',
+    '<h2 class="task-heading-clamp" title="' + escapeHtml(runView.task.goal) + '">' + escapeHtml(runView.task.goal) + '</h2>',
     '<div class="meta mono">' + escapeHtml(runView.run.id) + '</div>',
     '</div>',
     renderPill(getStateLabel(runView.run.status), getStateTone(runView.run.status)),
@@ -88,6 +93,7 @@ function renderRunPage(runView) {
       { label: 'изменённые файлы', value: String(runView.summary.changedFiles.length) },
       { label: 'score', value: runView.summary.score === null ? 'n/a' : String(runView.summary.score) },
     ]),
+    '<div class="toolbar">' + stopButton + deleteButton + '</div>',
     renderTaskActions(runView.taskActions, runView.task.id),
     renderPlanPreviewBlock(runView.summary),
     renderCriticFeedbackBlock(runView.summary),
@@ -123,7 +129,6 @@ function renderLogs(logs) {
     '<h2>Операционный журнал</h2>',
     '<div class="meta mono">' + escapeHtml(logs.path) + '</div>',
     '</div>',
-    renderPill('tail ' + String(logs.tail), ''),
     '</div>',
     entries.length === 0
       ? '<div class="empty">' + escapeHtml(copy.noLogs) + '</div>'

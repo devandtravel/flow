@@ -17,23 +17,23 @@ export const dashboardStyles = `
   --danger: #ff8f8f;
   --shadow-xl: 0 28px 64px rgba(0, 0, 0, 0.34);
   --shadow-md: 0 16px 36px rgba(0, 0, 0, 0.22);
-  --radius-xl: 24px;
-  --radius-lg: 18px;
-  --radius-md: 14px;
-  --page-pad: 28px;
-  --stack-gap: 20px;
-  --panel-pad: 20px;
-  --card-pad: 14px;
+  --radius-xl: 20px;
+  --radius-lg: 16px;
+  --radius-md: 12px;
+  --page-pad: 18px;
+  --stack-gap: 14px;
+  --panel-pad: 16px;
+  --card-pad: 12px;
   --max-main-width: 1480px;
   --font: "Avenir Next", "SF Pro Display", "Segoe UI", sans-serif;
   --mono: "SF Mono", "JetBrains Mono", monospace;
 }
 
 body.compact {
-  --page-pad: 20px;
-  --stack-gap: 14px;
-  --panel-pad: 16px;
-  --card-pad: 12px;
+  --page-pad: 16px;
+  --stack-gap: 12px;
+  --panel-pad: 14px;
+  --card-pad: 10px;
 }
 
 * {
@@ -138,7 +138,7 @@ button {
 }
 
 .brand h1 {
-  font-size: clamp(42px, 5vw, 64px);
+  font-size: clamp(28px, 3vw, 42px);
   line-height: 0.96;
   letter-spacing: -0.04em;
   overflow-wrap: anywhere;
@@ -182,7 +182,7 @@ button {
 }
 
 .hero-copy h2 {
-  font-size: 34px;
+  font-size: 24px;
   line-height: 1.05;
 }
 
@@ -262,7 +262,7 @@ button {
 .button {
   border: 0;
   border-radius: 14px;
-  padding: 11px 15px;
+  padding: 9px 13px;
   color: #07111a;
   background: linear-gradient(180deg, var(--accent-strong), var(--accent));
   cursor: pointer;
@@ -443,6 +443,23 @@ body.compact .task-card {
   overflow-wrap: anywhere;
 }
 
+.task-goal-clamp,
+.task-heading-clamp {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.task-goal-clamp {
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+.task-heading-clamp {
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
 .mono,
 pre,
 code {
@@ -482,7 +499,7 @@ pre {
 
 .status-value {
   margin-top: 8px;
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 700;
   min-height: 28px;
   display: flex;
@@ -504,7 +521,7 @@ pre {
 
 .kpi-value {
   margin-top: 8px;
-  font-size: 28px;
+  font-size: 22px;
   font-weight: 800;
 }
 
@@ -643,6 +660,10 @@ pre {
 .artifact-preview-panel,
 .run-view-panel {
   min-height: 100%;
+}
+
+.artifact-filter-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .patch-file-card {

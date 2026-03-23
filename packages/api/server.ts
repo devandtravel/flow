@@ -347,6 +347,11 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
         return;
       }
 
+      if (request.method === 'POST' && requestUrl.pathname === '/tasks/stop-all') {
+        sendJson(response, 200, runtime.stopAllTasks());
+        return;
+      }
+
       if (request.method === 'GET' && requestUrl.pathname.startsWith('/tasks/')) {
         const taskId = requestUrl.pathname.split('/')[2];
         if (requestUrl.pathname.endsWith('/view')) {
@@ -400,6 +405,12 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
       if (request.method === 'DELETE' && requestUrl.pathname.startsWith('/tasks/')) {
         const taskId = requestUrl.pathname.split('/')[2];
         sendJson(response, 200, runtime.deleteTask(taskId));
+        return;
+      }
+
+      if (request.method === 'POST' && requestUrl.pathname.startsWith('/tasks/') && requestUrl.pathname.endsWith('/stop')) {
+        const taskId = requestUrl.pathname.split('/')[2];
+        sendJson(response, 200, runtime.stopTask(taskId));
         return;
       }
 

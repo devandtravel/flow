@@ -2,11 +2,12 @@ export const dashboardRouteStateScript = `
 function loadPersistedState() {
   const storedTaskId = safeReadStorage(storageKeys.selectedTaskId);
   const storedView = safeReadStorage(storageKeys.activeView);
-  const storedCompactMode = safeReadStorage(storageKeys.compactMode);
   const storedPolling = safeReadStorage(storageKeys.pollingPaused);
   const storedTaskFilter = safeReadStorage(storageKeys.taskFilter);
   const storedEventLevelFilter = safeReadStorage(storageKeys.eventLevelFilter);
   const storedApprovalFilter = safeReadStorage(storageKeys.approvalFilter);
+  const storedArtifactRunFilter = safeReadStorage(storageKeys.artifactRunFilter);
+  const storedArtifactTypeFilter = safeReadStorage(storageKeys.artifactTypeFilter);
   const storedArtifactId = safeReadStorage(storageKeys.selectedArtifactId);
   if (storedTaskId) {
     state.selectedTaskId = storedTaskId;
@@ -24,12 +25,12 @@ function loadPersistedState() {
   if (storedPolling === 'true') {
     state.pollingPaused = true;
   }
-  if (storedCompactMode === 'true') {
-    state.compactMode = true;
-  }
+  state.compactMode = true;
   state.taskFilter = storedTaskFilter;
   state.eventLevelFilter = storedEventLevelFilter;
   state.approvalFilter = storedApprovalFilter;
+  state.artifactRunFilter = storedArtifactRunFilter;
+  state.artifactTypeFilter = storedArtifactTypeFilter;
   applyRouteState();
 }
 
@@ -38,11 +39,12 @@ function persistUiState(historyMode) {
   safeWriteStorage(storageKeys.selectedRunId, state.selectedRunId);
   safeWriteStorage(storageKeys.selectedArtifactId, state.selectedArtifactId);
   safeWriteStorage(storageKeys.activeView, state.activeView);
-  safeWriteStorage(storageKeys.compactMode, state.compactMode ? 'true' : 'false');
   safeWriteStorage(storageKeys.pollingPaused, state.pollingPaused ? 'true' : 'false');
   safeWriteStorage(storageKeys.taskFilter, state.taskFilter);
   safeWriteStorage(storageKeys.eventLevelFilter, state.eventLevelFilter);
   safeWriteStorage(storageKeys.approvalFilter, state.approvalFilter);
+  safeWriteStorage(storageKeys.artifactRunFilter, state.artifactRunFilter);
+  safeWriteStorage(storageKeys.artifactTypeFilter, state.artifactTypeFilter);
   syncRouteState(historyMode || 'replace');
 }
 
