@@ -212,6 +212,7 @@ export function buildPlanningPrompt(goal: string, memory: MemorySummary, tools: 
     '- use only concrete JSON values with double-quoted keys and string literals',
     '- never output pseudo-types, placeholders, unions, comments, angle brackets, or schema notation inside input_json or expected_json',
     '- match each step input_json exactly to the tool inputContract keys; do not invent field names',
+    '- expected_json must describe concrete observable results; use exact literals, booleans, or numbers, and do not use placeholder values such as "string"',
     '- for fs.write_file, content must be the complete final file text, not a placeholder such as "string" or a short summary of the intended edit',
     '- for repo.apply_patch, never use guessed context, placeholder lines, ellipses, or synthetic markers',
     '- repo.apply_patch accepts either a valid unified diff or a FLOW patch that begins with "*** Update File:", "*** Add File:", or "*** Delete File:"',

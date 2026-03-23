@@ -153,6 +153,7 @@ export type RuntimeUpdateEvent =
       runId: string;
       level: RunEventRecord['level'];
       message: string;
+      payload: Record<string, unknown>;
     }
   | {
       kind: 'approval_changed';
@@ -515,6 +516,7 @@ export class AgentRuntime {
       runId,
       level,
       message,
+      payload,
     });
     return event;
   }

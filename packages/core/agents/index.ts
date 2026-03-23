@@ -14,6 +14,7 @@ import {
   taskPlanResponseSchema,
 } from '../../llm/contracts';
 import type { ToolDefinition, ToolResult } from '../../tools';
+import { getStepSemanticValidationError } from './step-validation';
 
 function describeFailures(failures: string[]): string {
   if (failures.length === 0) {
@@ -21,38 +22,6 @@ function describeFailures(failures: string[]): string {
   }
 
   return failures.join('; ');
-}
-
-function getStepSemanticValidationError(step: ToolStep): string | undefined {
-  if (step.tool !== 'fs.write_file') {
-    return undefined;
-  }
-
-  const content = step.input['content'];
-  if (typeof content !== 'string') {
-    return 'content must be a string.';
-  }
-
-  const normalizedContent = content.trim().toLowerCase();
-  const reservedPlaceholderValues = new Set([
-    'string',
-    'number',
-    'boolean',
-    'object',
-    'array',
-    'null',
-    'undefined',
-  ]);
-
-  if (reservedPlaceholderValues.has(normalizedContent)) {
-    return 'content must contain the full file text, not a schema placeholder.';
-  }
-
-  if (/^updated .+ content\b/.test(normalizedContent)) {
-    return 'content must contain the final file body, not a summary of the intended change.';
-  }
-
-  return undefined;
 }
 
 export class PlannerAgent {

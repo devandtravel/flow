@@ -170,7 +170,8 @@ function parseFlatLineBlock(lines: string[], startIndex: number, expectedPrefixe
 }
 
 function parseFlowPatch(patch: string): FlowPatchOperation[] {
-  const lines = patch.replace(/\r\n/g, '\n').split('\n');
+  const normalizedPatch = patch.replace(/\r\n/g, '\n');
+  const lines = splitTextBuffer(normalizedPatch).lines;
   const operations: FlowPatchOperation[] = [];
   let index = 0;
 

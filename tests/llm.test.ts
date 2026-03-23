@@ -94,6 +94,7 @@ describe('LLM providers', () => {
     expect(prompt).toContain('You are planning for the FLOW runtime, not executing tools yourself.');
     expect(prompt).toContain('never use guessed context, placeholder lines, ellipses, or synthetic markers');
     expect(prompt).toContain('for fs.write_file, content must be the complete final file text');
+    expect(prompt).toContain('expected_json must describe concrete observable results');
   });
 
   it('critic rejects placeholder fs.write_file content before execution', async () => {
@@ -128,6 +129,41 @@ describe('LLM providers', () => {
 
     expect(review.valid).toBe(false);
     expect(review.feedback[0]).toContain('full file text');
+  });
+
+  it('critic rejects placeholder expected values before execution', async () => {
+    const registry = createToolRegistry();
+    const readTool = registry.get('fs.read_file');
+    if (!readTool) {
+      throw new Error('Expected fs.read_file tool to be registered.');
+    }
+
+    const critic = new CriticAgent(new MockLlmProvider());
+    const review = await critic.validate(
+      {
+        goal: 'inspect file',
+        assumptions: [],
+        risks: [],
+        steps: [
+          {
+            tool: 'fs.read_file',
+            input: {
+              path: 'README.md',
+            },
+            expected: {
+              content: 'string',
+            },
+            rationale: 'placeholder expectation',
+          },
+        ],
+        done: false,
+        confidence: 0.2,
+      },
+      [readTool],
+    );
+
+    expect(review.valid).toBe(false);
+    expect(review.feedback[0]).toContain('concrete verification values');
   });
 
   it('rejects pseudo-json tool payloads in task plan steps', () => {

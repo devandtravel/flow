@@ -5,6 +5,7 @@ import { Command } from 'commander';
 import { createApiServer } from '../api/server';
 import { ensureAgentDirectories, loadConfig, writeDefaultConfig } from '../config';
 import { AgentRuntime } from '../core/loop/runtime';
+import { attachCliRunProgress } from './progress';
 
 const program = new Command();
 const workspaceRoot = process.cwd();
@@ -44,8 +45,13 @@ program
   .action(async (goal: string, options: { target?: string }) => {
     const runtime = createRuntime();
     const task = runtime.createTask(goal, options.target);
-    const summary = await runtime.runTask(task.id);
-    console.log(JSON.stringify(summary, null, 2));
+    const detachProgress = attachCliRunProgress(task.id, (listener) => runtime.subscribe(listener));
+    try {
+      const summary = await runtime.runTask(task.id);
+      console.log(JSON.stringify(summary, null, 2));
+    } finally {
+      detachProgress();
+    }
   });
 
 program

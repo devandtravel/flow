@@ -49,4 +49,28 @@ describe('tool registry', () => {
       expect(result.error).toContain('workspace boundary');
     }
   });
+
+  it('applies FLOW patch format updates through repo.apply_patch', async () => {
+    const tools = createToolRegistry();
+    await executeTool(tools, 'fs.write_file', { path: 'README.md', content: '# Example\n\n## Production\n' }, context);
+
+    const result = await executeTool(
+      tools,
+      'repo.apply_patch',
+      {
+        patch: [
+          '*** Update File: README.md',
+          '@@',
+          ' ## Production',
+          '+',
+          '+## Проверка FLOW',
+          '+Эта ветка используется для проверки runtime FLOW.',
+        ].join('\n'),
+      },
+      context,
+    );
+
+    expect(result.success).toBe(true);
+    expect(readFileSync(path.join(workspaceRoot, 'README.md'), 'utf8')).toContain('## Проверка FLOW');
+  });
 });
