@@ -32,6 +32,11 @@ const cursorPageSchema = z.object({
   previousCursor: z.string().nullable(),
 });
 
+const taskControlViewModelSchema = z.object({
+  stopRequested: z.boolean(),
+  deleteAfterStop: z.boolean(),
+});
+
 const taskActionViewModelSchema = z.object({
   action: z.enum(['retry', 'replan', 'retry_with_constraints', 'replan_from_feedback', 'escalate', 'cancel']),
   label: z.string().min(1),
@@ -128,9 +133,15 @@ export const artifactBrowserRunGroupViewModelSchema = z.object({
 });
 export type ArtifactBrowserRunGroupViewModel = z.infer<typeof artifactBrowserRunGroupViewModelSchema>;
 
+const artifactBrowserFilterOptionsSchema = z.object({
+  runIds: z.array(z.string().uuid()),
+  artifactTypes: z.array(artifactRecordSchema.shape.type),
+});
+
 export const artifactBrowserViewModelSchema = z.object({
   taskId: z.string().uuid(),
   page: cursorPageSchema,
+  filterOptions: artifactBrowserFilterOptionsSchema,
   runs: z.array(artifactBrowserRunGroupViewModelSchema),
 });
 export type ArtifactBrowserViewModel = z.infer<typeof artifactBrowserViewModelSchema>;
@@ -159,6 +170,7 @@ export type RunSummaryViewModel = z.infer<typeof runSummaryViewModelSchema>;
 
 export const runViewModelSchema = z.object({
   task: taskRecordSchema,
+  taskControl: taskControlViewModelSchema,
   run: runRecordSchema,
   eventsPage: cursorPageSchema,
   events: z.array(runEventRecordSchema),
@@ -171,6 +183,7 @@ export type RunViewModel = z.infer<typeof runViewModelSchema>;
 
 export const taskViewModelSchema = z.object({
   task: taskRecordSchema,
+  control: taskControlViewModelSchema,
   approvals: z.array(approvalRequestRecordSchema),
   runsPage: cursorPageSchema,
   runs: z.array(runSummaryViewModelSchema),
@@ -185,6 +198,11 @@ export const taskViewModelSchema = z.object({
   actions: z.array(taskActionViewModelSchema),
 });
 export type TaskViewModel = z.infer<typeof taskViewModelSchema>;
+
+export const dashboardTaskViewModelSchema = taskRecordSchema.extend({
+  control: taskControlViewModelSchema,
+});
+export type DashboardTaskViewModel = z.infer<typeof dashboardTaskViewModelSchema>;
 
 export const dashboardFiltersViewModelSchema = z.object({
   taskState: z.string(),
@@ -540,6 +558,10 @@ export function buildArtifactBrowserViewModel(
   input: {
     taskId: string;
     artifacts: TaskArtifactView[];
+    filterOptions: {
+      runIds: string[];
+      artifactTypes: Array<TaskArtifactView['type']>;
+    };
     page: {
       total: number;
       limit: number;
@@ -588,6 +610,10 @@ export function buildArtifactBrowserViewModel(
     taskId: input.taskId,
     page: {
       ...buildCursorPageEnvelope(input.page),
+    },
+    filterOptions: {
+      runIds: input.filterOptions.runIds,
+      artifactTypes: input.filterOptions.artifactTypes,
     },
     runs: [...groupedRuns.entries()].map((entry) =>
       artifactBrowserRunGroupViewModelSchema.parse({
@@ -689,6 +715,10 @@ function buildTaskActionViewModels(actions: Array<'retry' | 'replan' | 'retry_wi
 
 export function buildTaskViewModel(input: {
   task: TaskRecord;
+  control: {
+    stopRequested: boolean;
+    deleteAfterStop: boolean;
+  };
   approvals: ApprovalRequestRecord[];
   runs: Array<{
     run: RunRecord;
@@ -711,6 +741,7 @@ export function buildTaskViewModel(input: {
 
   return taskViewModelSchema.parse({
     task: input.task,
+    control: input.control,
     approvals: input.approvals,
     runsPage: buildCursorPageEnvelope(input.page),
     runs: runSummaries,
@@ -728,6 +759,10 @@ export function buildTaskViewModel(input: {
 
 export function buildRunViewModel(
   task: TaskRecord,
+  taskControl: {
+    stopRequested: boolean;
+    deleteAfterStop: boolean;
+  },
   run: RunRecord,
   steps: StepRecord[],
   events: RunEventRecord[],
@@ -744,6 +779,7 @@ export function buildRunViewModel(
   const summary = buildRunSummary(run, steps, summaryEvents, evaluations, maxIterations);
   return runViewModelSchema.parse({
     task,
+    taskControl,
     run,
     eventsPage: buildCursorPageEnvelope(page),
     events,
@@ -752,6 +788,21 @@ export function buildRunViewModel(
     summary: summary.summary,
     taskActions: buildTaskActionViewModels(actions),
   });
+}
+
+export function buildDashboardTaskListViewModel(input: {
+  tasks: TaskRecord[];
+  controlStates: Record<string, { stopRequested: boolean; deleteAfterStop: boolean }>;
+}): DashboardTaskViewModel[] {
+  return input.tasks.map((task) =>
+    dashboardTaskViewModelSchema.parse({
+      ...task,
+      control: input.controlStates[task.id] ?? {
+        stopRequested: false,
+        deleteAfterStop: false,
+      },
+    }),
+  );
 }
 
 export function buildDashboardFiltersViewModel(input: {

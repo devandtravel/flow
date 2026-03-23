@@ -138,7 +138,7 @@ button {
 }
 
 .brand h1 {
-  font-size: clamp(28px, 3vw, 42px);
+  font-size: clamp(24px, 2.2vw, 34px);
   line-height: 0.96;
   letter-spacing: -0.04em;
   overflow-wrap: anywhere;
@@ -182,7 +182,7 @@ button {
 }
 
 .hero-copy h2 {
-  font-size: 24px;
+  font-size: 20px;
   line-height: 1.05;
 }
 
@@ -414,12 +414,17 @@ button {
 }
 
 .task-card-actions {
-  display: flex;
-  justify-content: flex-end;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 
-.task-delete-button {
+.task-card-actions > .button {
   width: 100%;
+}
+
+.task-card-actions > .button:only-child {
+  grid-column: 1 / -1;
 }
 
 body.compact .task-card {
@@ -484,6 +489,40 @@ pre {
   color: #ffe6e6;
 }
 
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(3, 7, 12, 0.64);
+  backdrop-filter: blur(12px);
+  z-index: 40;
+}
+
+.dialog-panel {
+  width: min(100%, 520px);
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--border-strong);
+  background: linear-gradient(180deg, rgba(22, 31, 46, 0.98), rgba(11, 18, 28, 0.98));
+  box-shadow: var(--shadow-xl);
+}
+
+.dialog-panel.warning {
+  border-color: rgba(244, 195, 99, 0.32);
+}
+
+.dialog-panel.danger {
+  border-color: rgba(255, 143, 143, 0.32);
+}
+
+.dialog-actions {
+  justify-content: flex-end;
+}
+
 .status-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -521,7 +560,7 @@ pre {
 
 .kpi-value {
   margin-top: 8px;
-  font-size: 22px;
+  font-size: 18px;
   font-weight: 800;
 }
 

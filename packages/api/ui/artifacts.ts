@@ -168,28 +168,18 @@ function renderArtifactFilterBar(artifactBrowser) {
     return '';
   }
 
-  const runOptions = artifactBrowser.runs.map((runGroup) => ({
-    value: runGroup.runId,
-    label: runGroup.runId,
-  }));
-  const artifactTypes = [];
-
-  for (const runGroup of artifactBrowser.runs) {
-    if (!Array.isArray(runGroup.steps)) {
-      continue;
-    }
-    for (const stepGroup of runGroup.steps) {
-      if (!Array.isArray(stepGroup.artifacts)) {
-        continue;
-      }
-      for (const artifactItem of stepGroup.artifacts) {
-        const artifactType = artifactItem && artifactItem.artifact ? artifactItem.artifact.type : '';
-        if (typeof artifactType === 'string' && artifactType.length > 0 && !artifactTypes.includes(artifactType)) {
-          artifactTypes.push(artifactType);
-        }
-      }
-    }
-  }
+  const filterOptions = artifactBrowser.filterOptions && typeof artifactBrowser.filterOptions === 'object'
+    ? artifactBrowser.filterOptions
+    : { runIds: [], artifactTypes: [] };
+  const runOptions = Array.isArray(filterOptions.runIds)
+    ? filterOptions.runIds.map((runId) => ({
+        value: runId,
+        label: runId,
+      }))
+    : [];
+  const artifactTypes = Array.isArray(filterOptions.artifactTypes)
+    ? filterOptions.artifactTypes.filter((artifactType) => typeof artifactType === 'string' && artifactType.length > 0)
+    : [];
 
   return [
     '<div class="filter-grid artifact-filter-grid">',

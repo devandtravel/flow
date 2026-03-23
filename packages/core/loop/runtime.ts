@@ -111,6 +111,11 @@ export interface DeletedTasksSummary {
   };
 }
 
+export interface TaskControlState {
+  stopRequested: boolean;
+  deleteAfterStop: boolean;
+}
+
 export interface PageOptions {
   limit?: number;
   offset?: number;
@@ -333,6 +338,30 @@ function isTaskStoppableState(state: TaskRecord['state']): boolean {
   return ['queued', 'planning', 'validating', 'executing', 'awaiting_approval', 'verifying', 'retryable'].includes(state);
 }
 
+function toLoggerMethod(level: RunEventRecord['level'] | 'info'): 'info' | 'warn' | 'error' {
+  if (level === 'warning') {
+    return 'warn';
+  }
+  if (level === 'error') {
+    return 'error';
+  }
+  return 'info';
+}
+
+function compactLogDetails(details: Record<string, unknown>): Record<string, string | number | boolean> {
+  const compact: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(details)) {
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      compact[key] = value;
+      continue;
+    }
+    if (Array.isArray(value) && value.every((item) => typeof item === 'string')) {
+      compact[key] = value.length;
+    }
+  }
+  return compact;
+}
+
 export class AgentRuntime {
   readonly workspaceRoot: string;
   readonly config: RuntimeConfig;
@@ -378,6 +407,27 @@ export class AgentRuntime {
 
     this.synchronizeTargets();
     this.synchronizeSchedules();
+    this.logRuntime('info', 'Контур инициализирован', {
+      category: 'runtime',
+      workspaceRoot: this.workspaceRoot,
+      mode: this.config.mode,
+      autonomy: this.config.autonomy.mode,
+    });
+  }
+
+  private logRuntime(
+    level: 'info' | 'warn' | 'error',
+    message: string,
+    details: Record<string, unknown>,
+  ): void {
+    const compactDetails = compactLogDetails(details);
+    this.logger[level](
+      {
+        category: typeof details['category'] === 'string' ? details['category'] : 'runtime',
+        ...compactDetails,
+      },
+      message,
+    );
   }
 
   private buildPolicyConfig() {
@@ -645,14 +695,29 @@ export class AgentRuntime {
       taskId,
       deleteAfterStop,
     });
+    this.logRuntime('warn', 'Запрошена остановка задачи', {
+      category: 'task_lifecycle',
+      taskId,
+      state: task.state,
+      deleteAfterStop,
+    });
+    const latestRun = this.getLatestRunForTask(taskId);
+    if (latestRun && !['completed', 'failed', 'cancelled', 'escalated'].includes(latestRun.status)) {
+      this.createRunEvent(task.id, latestRun.id, 'warning', 'task_stop_requested', {
+        deleteAfterStop,
+        state: task.state,
+      });
+    }
 
     if (task.state === 'queued' || task.state === 'retryable' || task.state === 'awaiting_approval') {
-      const latestRun = this.getLatestRunForTask(taskId);
       if (latestRun && latestRun.status === 'awaiting_approval') {
         this.finishRun(latestRun, 'cancelled');
       }
       this.rejectPendingApprovalsForTask(taskId);
       const cancelledTask = this.transitionTask(task, 'cancelled');
+      if (!deleteAfterStop) {
+        this.clearTaskStopRequests(taskId);
+      }
       return cancelledTask;
     }
 
@@ -704,6 +769,13 @@ export class AgentRuntime {
       kind: 'task_deleted',
       taskId,
     });
+    this.logRuntime('warn', 'Задача удалена', {
+      category: 'task_lifecycle',
+      taskId,
+      runs: deletion.deletedCounts.runs,
+      steps: deletion.deletedCounts.steps,
+      artifacts: deletion.deletedCounts.artifacts,
+    });
     return {
       taskId,
       deletedCounts: {
@@ -745,6 +817,13 @@ export class AgentRuntime {
     payload: Record<string, unknown>,
   ): RunEventRecord {
     const event = this.database.createRunEvent(runId, level, message, payload);
+    this.logRuntime(toLoggerMethod(level), 'Событие выполнения', {
+      category: 'run_event',
+      taskId,
+      runId,
+      event: message,
+      ...payload,
+    });
     this.emitRuntimeUpdate({
       kind: 'run_event',
       taskId,
@@ -895,7 +974,7 @@ export class AgentRuntime {
     const executionContext: ToolExecutionContext = {
       workspaceRoot: target.root,
       policy: this.policy,
-      httpAllowlist: this.config.workspace.http_allowlist,
+      httpAllowlist: this.config.http.allowlist,
     };
     const snapshotPaths = new Set<string>();
     let executedSteps = 0;
@@ -1080,6 +1159,12 @@ export class AgentRuntime {
     }
 
     const createdTask = this.database.createTask(goal, resolvedTargetId, priority);
+    this.logRuntime('info', 'Создана задача', {
+      category: 'task_lifecycle',
+      taskId: createdTask.id,
+      targetId: createdTask.target_id,
+      state: createdTask.state,
+    });
     this.emitRuntimeUpdate({
       kind: 'task_changed',
       taskId: createdTask.id,
@@ -1090,6 +1175,26 @@ export class AgentRuntime {
 
   listTasks(): TaskRecord[] {
     return this.database.listTasks();
+  }
+
+  getTaskControlState(taskId: string): TaskControlState {
+    this.requireTask(taskId);
+    return {
+      stopRequested: this.isStopRequested(taskId),
+      deleteAfterStop: this.isDeleteAfterStopRequested(taskId),
+    };
+  }
+
+  listTaskControlStates(taskIds?: string[]): Record<string, TaskControlState> {
+    const ids = taskIds ?? this.listTasks().map((task) => task.id);
+    const controlStates: Record<string, TaskControlState> = {};
+    for (const taskId of ids) {
+      controlStates[taskId] = {
+        stopRequested: this.isStopRequested(taskId),
+        deleteAfterStop: this.isDeleteAfterStopRequested(taskId),
+      };
+    }
+    return controlStates;
   }
 
   stopTask(taskId: string): TaskRecord {
@@ -1343,6 +1448,15 @@ export class AgentRuntime {
       operation: maintenanceEvent.operation,
       maintenanceEventId: maintenanceEvent.id,
     });
+    this.logRuntime('info', 'Обслуживание завершено', {
+      category: 'maintenance',
+      event: maintenanceEvent.operation,
+      dryRun,
+      trigger,
+      artifacts: cleanupSummary.deletedArtifactIds.length,
+      runEvents: cleanupSummary.deletedRunEventIds.length,
+      memoryEntries: cleanupSummary.deletedMemoryEntryIds.length,
+    });
 
     return {
       maintenanceEventId: maintenanceEvent.id,
@@ -1560,6 +1674,13 @@ export class AgentRuntime {
       taskId: updated.task_id,
       state: 'queued',
     });
+    this.logRuntime('info', 'Подтверждение принято', {
+      category: 'approval',
+      taskId: updated.task_id,
+      runId: updated.run_id,
+      approvalId: updated.id,
+      state: updated.status,
+    });
     return updated;
   }
 
@@ -1578,6 +1699,13 @@ export class AgentRuntime {
       kind: 'task_changed',
       taskId: updated.task_id,
       state: 'blocked',
+    });
+    this.logRuntime('warn', 'Подтверждение отклонено', {
+      category: 'approval',
+      taskId: updated.task_id,
+      runId: updated.run_id,
+      approvalId: updated.id,
+      state: updated.status,
     });
     return updated;
   }
@@ -1643,6 +1771,13 @@ export class AgentRuntime {
 
     const updatedTask = this.transitionTask(task, nextState);
     this.recordTaskOperatorAction(taskId, action, task.state, updatedTask.state);
+    this.logRuntime(action === 'cancel' ? 'warn' : 'info', 'Применено операторское действие', {
+      category: 'task_lifecycle',
+      taskId,
+      action,
+      fromState: task.state,
+      state: updatedTask.state,
+    });
     return updatedTask;
   }
 

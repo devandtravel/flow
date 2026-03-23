@@ -100,6 +100,44 @@ describe('AgentRuntime', () => {
     expect(runtime.listTasks()).toHaveLength(0);
   });
 
+  it('exposes stop-requested control state for an active task before safe cancellation', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-stop-pending-'));
+    const config = buildDefaultConfig(workspaceRoot, 'project');
+    config.autonomy.mode = 'autonomous';
+    const provider = new DelayedMockProvider(300);
+    const runtime = new AgentRuntime({
+      workspaceRoot,
+      config,
+      provider,
+    });
+
+    const task = runtime.createTask('show pending stop state');
+    const runPromise = runtime.runTask(task.id);
+
+    await new Promise<void>((resolve) => {
+      setTimeout(() => resolve(), 50);
+    });
+
+    runtime.stopTask(task.id);
+    expect(runtime.getTaskControlState(task.id)).toEqual({
+      stopRequested: true,
+      deleteAfterStop: false,
+    });
+    const inspected = runtime.inspectTask(task.id);
+    const activeRunId = inspected.runs[0]?.id;
+    expect(typeof activeRunId).toBe('string');
+    if (!activeRunId) {
+      throw new Error('Expected an active run after stop request.');
+    }
+    const runEvents = runtime.getRunEvents(activeRunId, { limit: 20, offset: 0 });
+    expect(runEvents.events.map((event) => event.message)).toEqual(
+      expect.arrayContaining(['task_stop_requested']),
+    );
+
+    const summary = await runPromise;
+    expect(summary.state).toBe('cancelled');
+  });
+
   it('stop-and-delete all tasks, including queued tasks, through the bulk deletion path', async () => {
     const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-delete-all-guard-'));
     const config = buildDefaultConfig(workspaceRoot, 'project');

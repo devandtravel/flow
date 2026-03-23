@@ -26,7 +26,7 @@ function renderRun(run) {
 
 function renderOverview(taskView, maintenance, metrics, tasks) {
   const hasTasks = Array.isArray(tasks) && tasks.length > 0;
-  const hasStoppableTasks = Array.isArray(tasks) && tasks.some(isTaskStoppable);
+  const hasStoppableTasks = Array.isArray(tasks) && tasks.some((task) => isTaskStoppable(task) && !isTaskStopPending(task));
   const overviewBody = !taskView || !taskView.task
     ? '<section class="panel stack"><div class="empty">' + escapeHtml(copy.noTaskSelected) + '</div></section>'
     : [
@@ -61,11 +61,13 @@ function renderRunPage(runView) {
     return '<section class="panel stack"><div class="empty">Выберите запуск для просмотра.</div></section>';
   }
 
+  const stopPending = runView.taskControl && runView.taskControl.stopRequested === true;
+  const deletePending = stopPending && runView.taskControl.deleteAfterStop === true;
   const stopButton = isTaskStoppable(runView.task)
-    ? '<button type="button" class="button warning" data-task-stop-id="' + escapeHtml(runView.task.id) + '">' + escapeHtml(copy.stopTask) + '</button>'
+    ? '<button type="button" class="button warning" data-task-stop-id="' + escapeHtml(runView.task.id) + '"' + (stopPending ? ' disabled' : '') + '>' + escapeHtml(stopPending ? copy.stopRequested : copy.stopTask) + '</button>'
     : '';
   const deleteButton =
-    '<button type="button" class="button danger" data-task-delete-id="' + escapeHtml(runView.task.id) + '">' + escapeHtml(copy.deleteTask) + '</button>';
+    '<button type="button" class="button danger" data-task-delete-id="' + escapeHtml(runView.task.id) + '"' + (deletePending ? ' disabled' : '') + '>' + escapeHtml(deletePending ? copy.deleteRequested : copy.deleteTask) + '</button>';
 
   return [
     '<section class="stack run-view-panel">',
@@ -85,6 +87,7 @@ function renderRunPage(runView) {
           : 'Запуск открыт в режиме permalink.',
       ) +
     '</div>',
+    stopPending ? '<div class="meta">' + escapeHtml(deletePending ? copy.deleteRequested : copy.stopRequested) + '</div>' : '',
     createKeyFacts([
       { label: 'task', value: runView.task.id },
       { label: copy.attempt, value: runView.summary.attempt.label },
@@ -116,35 +119,4 @@ function renderRunPage(runView) {
   ].join('');
 }
 
-function renderLogs(logs) {
-  if (!logs) {
-    return '<section class="panel stack"><div class="empty">' + escapeHtml(copy.noLogs) + '</div></section>';
-  }
-  const entries = parseLogEntries(logs);
-  return [
-    '<section class="panel stack">',
-    '<div class="toolbar spread">',
-    '<div class="stack gap-xs">',
-    '<div class="eyebrow">Журналы runtime</div>',
-    '<h2>Операционный журнал</h2>',
-    '<div class="meta mono">' + escapeHtml(logs.path) + '</div>',
-    '</div>',
-    '</div>',
-    entries.length === 0
-      ? '<div class="empty">' + escapeHtml(copy.noLogs) + '</div>'
-      : '<div class="stack">' + entries.map((entry) => [
-          '<article class="event-card ' + escapeHtml(entry.level) + '">',
-          '<div class="toolbar spread">',
-          '<div class="stack gap-xs">',
-          '<strong>' + escapeHtml(entry.title) + '</strong>',
-          entry.summary ? '<div class="meta">' + escapeHtml(entry.summary) + '</div>' : '',
-          '</div>',
-          entry.time ? '<span class="meta mono">' + escapeHtml(entry.time) + '</span>' : '',
-          '</div>',
-          entry.details ? createRawDetails(copy.rawDetails + ': log entry', entry.details) : '',
-          '</article>',
-        ].join('')).join('') + '</div>',
-    '</section>',
-  ].join('');
-}
 `.trim();

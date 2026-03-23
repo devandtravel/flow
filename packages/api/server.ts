@@ -9,9 +9,11 @@ import { approvalStatusSchema, artifactTypeSchema, capabilityNameSchema, eventLe
 import { isDomainError } from '../errors';
 import { decodePageCursor } from './pagination';
 import { getDashboardAsset } from './ui';
+import { buildRuntimeLogViewModel } from './log-view-models';
 import {
   buildArtifactBrowserViewModel,
   buildArtifactPreviewViewModel,
+  buildDashboardTaskListViewModel,
   buildDashboardFiltersViewModel,
   buildDashboardSelectionViewModel,
   buildTaskViewModel,
@@ -110,7 +112,7 @@ function parseRunEventFilter(requestUrl: URL): { level?: z.infer<typeof eventLev
 }
 
 function parseLogQuery(requestUrl: URL): z.infer<typeof logQuerySchema> {
-  const tailValue = requestUrl.searchParams.get('tail');
+  const tailValue = requestUrl.searchParams.get('tail') ?? requestUrl.searchParams.get('limit');
   return logQuerySchema.parse({
     tail: tailValue ? Number(tailValue) : undefined,
   });
@@ -258,6 +260,7 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
         const filters = parseDashboardFilterQuery(requestUrl);
         const allTasks = runtime.listTasks();
         const tasks = filterTasksByState(allTasks, filters.taskState);
+        const taskControlStates = runtime.listTaskControlStates(tasks.map((task) => task.id));
         const approvals = filterApprovalsByStatus(runtime.listApprovals(), filters.approvalStatus);
         const requestedTaskExists = taskId ? allTasks.some((task) => task.id === taskId) : false;
         const timeline = taskId && requestedTaskExists
@@ -274,7 +277,10 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
             requestedTaskId: taskId ?? undefined,
             requestedTaskExists,
           }),
-          tasks,
+          tasks: buildDashboardTaskListViewModel({
+            tasks,
+            controlStates: taskControlStates,
+          }),
           approvals,
           targets: runtime.listTargets(),
           schedules: runtime.listSchedules(),
@@ -364,6 +370,7 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
               ...runtime.getTaskView(taskId, page, {
                 status: filter.runStatus,
               }),
+              control: runtime.getTaskControlState(taskId),
               maxIterations: runtime.config.limits.max_iterations,
               actions: runtime.listTaskOperatorActions(taskId),
             }),
@@ -378,12 +385,28 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
             tool: filter.tool,
             type: filter.artifactType,
           });
+          const allTaskArtifacts = runtime.getTaskArtifacts(taskId);
+          const filterScopeArtifacts = allTaskArtifacts.filter((artifact) => {
+            if (filter.runId && artifact.runId !== filter.runId) {
+              return false;
+            }
+            if (filter.tool && artifact.tool !== filter.tool) {
+              return false;
+            }
+            return true;
+          });
+          const runIds = [...new Set(allTaskArtifacts.map((artifact) => artifact.runId))];
+          const artifactTypes = [...new Set(filterScopeArtifacts.map((artifact) => artifact.type))];
           sendJson(
             response,
             200,
             buildArtifactBrowserViewModel({
               taskId,
               artifacts: artifactPage.artifacts,
+              filterOptions: {
+                runIds,
+                artifactTypes,
+              },
               page: artifactPage.page,
             }),
           );
@@ -557,6 +580,7 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
             200,
             buildRunViewModel(
               runPayload.task,
+              runtime.getTaskControlState(runPayload.task.id),
               runPayload.run,
               runPayload.steps,
               runPayload.events,
@@ -607,6 +631,22 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
           tail: query.tail ?? 400,
           content: tailText(content, query.tail ?? 400),
         });
+        return;
+      }
+
+      if (request.method === 'GET' && requestUrl.pathname === '/logs/runtime/view') {
+        const query = parseLogQuery(requestUrl);
+        const logsPath = path.join(workspaceRoot, '.agent', 'logs', 'runtime.log');
+        const content = existsSync(logsPath) ? readFileSync(logsPath, 'utf8') : '';
+        sendJson(
+          response,
+          200,
+          buildRuntimeLogViewModel({
+            path: logsPath,
+            limit: query.tail ?? 200,
+            content: tailText(content, query.tail ?? 200),
+          }),
+        );
         return;
       }
 

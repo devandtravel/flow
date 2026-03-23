@@ -94,11 +94,13 @@ function renderRunSummaryCard(runEntry) {
 function renderTaskHeader(taskView) {
   const latestRun = Array.isArray(taskView.runs) && taskView.runs.length > 0 ? taskView.runs[0] : null;
   const summary = taskView.summary && typeof taskView.summary === 'object' ? taskView.summary : null;
+  const stopPending = taskView.control && taskView.control.stopRequested === true;
+  const deletePending = stopPending && taskView.control.deleteAfterStop === true;
   const stopButton = isTaskStoppable(taskView.task)
-    ? '<button type="button" class="button warning" data-task-stop-id="' + escapeHtml(taskView.task.id) + '">' + escapeHtml(copy.stopTask) + '</button>'
+    ? '<button type="button" class="button warning" data-task-stop-id="' + escapeHtml(taskView.task.id) + '"' + (stopPending ? ' disabled' : '') + '>' + escapeHtml(stopPending ? copy.stopRequested : copy.stopTask) + '</button>'
     : '';
   const deleteButton =
-    '<button type="button" class="button danger" data-task-delete-id="' + escapeHtml(taskView.task.id) + '">' + escapeHtml(copy.deleteTask) + '</button>';
+    '<button type="button" class="button danger" data-task-delete-id="' + escapeHtml(taskView.task.id) + '"' + (deletePending ? ' disabled' : '') + '>' + escapeHtml(deletePending ? copy.deleteRequested : copy.deleteTask) + '</button>';
 
   return [
     '<section class="panel stack task-header-panel">',
@@ -117,6 +119,7 @@ function renderTaskHeader(taskView) {
           : 'Задача создана. Запуски ещё не зафиксированы.',
       ) +
     '</div>',
+    stopPending ? '<div class="meta">' + escapeHtml(deletePending ? copy.deleteRequested : copy.stopRequested) + '</div>' : '',
     createKeyFacts([
       { label: 'target', value: taskView.task.target_id },
       { label: 'updated', value: formatRelativeTime(summary ? summary.updatedAt : taskView.task.updated_at) },

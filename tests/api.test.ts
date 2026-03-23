@@ -287,9 +287,40 @@ describe('API server', () => {
       expect(artifactDocumentResponse.headers.get('content-type')).toContain('text/html');
 
       const filteredArtifactBrowserResponse = await fetch(
-        `${currentBaseUrl}/tasks/${summaryJson.task.id}/artifacts/browser?limit=8&offset=0&tool=repo.run_checks&artifactType=result`,
+        `${currentBaseUrl}/tasks/${summaryJson.task.id}/artifacts/browser?limit=8&offset=0&artifactType=result`,
       );
       expect(filteredArtifactBrowserResponse.status).toBe(200);
+      const filteredArtifactBrowserJson = await filteredArtifactBrowserResponse.json();
+      expect(filteredArtifactBrowserJson.filterOptions).toEqual(
+        expect.objectContaining({
+          runIds: expect.any(Array),
+          artifactTypes: expect.arrayContaining(['result']),
+        }),
+      );
+      expect(
+        filteredArtifactBrowserJson.runs.every((runGroup: { steps: Array<{ artifacts: Array<{ artifact: { type: string; tool: string } }> }> }) =>
+          runGroup.steps.every((stepGroup) =>
+            stepGroup.artifacts.every((artifactEntry) =>
+              artifactEntry.artifact.type === 'result',
+            ),
+          ),
+        ),
+      ).toBe(true);
+
+      const logViewResponse = await fetch(`${currentBaseUrl}/logs/runtime/view?limit=50`);
+      expect(logViewResponse.status).toBe(200);
+      const logViewJson = await logViewResponse.json();
+      expect(logViewJson).toEqual(
+        expect.objectContaining({
+          path: expect.any(String),
+          limit: 50,
+          summary: expect.objectContaining({
+            totalEntries: expect.any(Number),
+          }),
+          entries: expect.any(Array),
+        }),
+      );
+      expect(logViewJson.summary.totalEntries).toBeGreaterThan(0);
     }
   }, 10000);
 
@@ -452,6 +483,43 @@ describe('API server', () => {
           state: 'cancelled',
         }),
       ]),
+    );
+  });
+
+  it('returns task control fields in dashboard and task views', async () => {
+    const createResponse = await fetch(`${currentBaseUrl}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ goal: 'task with control view model' }),
+    });
+    expect(createResponse.status).toBe(201);
+    const taskJson = await createResponse.json();
+
+    const dashboardResponse = await fetch(`${currentBaseUrl}/dashboard/state?taskId=${taskJson.id}`);
+    expect(dashboardResponse.status).toBe(200);
+    const dashboardJson = await dashboardResponse.json();
+    expect(dashboardJson.tasks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: taskJson.id,
+          control: expect.objectContaining({
+            stopRequested: false,
+            deleteAfterStop: false,
+          }),
+        }),
+      ]),
+    );
+
+    const taskViewResponse = await fetch(`${currentBaseUrl}/tasks/${taskJson.id}/view`);
+    expect(taskViewResponse.status).toBe(200);
+    const taskViewJson = await taskViewResponse.json();
+    expect(taskViewJson).toEqual(
+      expect.objectContaining({
+        control: expect.objectContaining({
+          stopRequested: false,
+          deleteAfterStop: false,
+        }),
+      }),
     );
   });
 

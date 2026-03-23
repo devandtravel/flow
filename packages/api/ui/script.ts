@@ -1,11 +1,15 @@
 import { dashboardArtifactViewsScript } from './artifacts';
 import { dashboardCopyScript } from './copy';
+import { dashboardDialogsScript } from './dialogs';
+import { dashboardLogsScript } from './logs';
 import { dashboardRouteStateScript } from './routes';
 import { dashboardRunInsightsScript } from './run-insights';
 import { dashboardTaskViewsScript } from './task-views';
 
 export const dashboardScript = `
 ${dashboardCopyScript}
+${dashboardDialogsScript}
+${dashboardLogsScript}
 ${dashboardRunInsightsScript}
 
 const terminalStates = ['completed', 'failed', 'escalated', 'blocked', 'cancelled', 'rolled_back'];
@@ -460,6 +464,30 @@ function isTaskStoppable(task) {
   return task && ['queued', 'planning', 'validating', 'executing', 'awaiting_approval', 'verifying', 'retryable'].includes(task.state);
 }
 
+function getTaskControl(task) {
+  if (!task || typeof task !== 'object' || !task.control || typeof task.control !== 'object') {
+    return {
+      stopRequested: false,
+      deleteAfterStop: false,
+    };
+  }
+
+  return {
+    stopRequested: task.control.stopRequested === true,
+    deleteAfterStop: task.control.deleteAfterStop === true,
+  };
+}
+
+function isTaskStopPending(task) {
+  const control = getTaskControl(task);
+  return control.stopRequested;
+}
+
+function isTaskDeletePending(task) {
+  const control = getTaskControl(task);
+  return control.stopRequested && control.deleteAfterStop;
+}
+
 function renderTaskGoal(value) {
   const text = typeof value === 'string' ? value : '';
   return '<span class="task-goal-clamp" title="' + escapeHtml(text) + '">' + escapeHtml(text) + '</span>';
@@ -725,6 +753,33 @@ function describeEvent(event) {
       raw: payload,
     };
   }
+  if (event.message === 'task_stop_requested') {
+    const deleteAfterStop = payload && payload.deleteAfterStop === true;
+    const state = payload && typeof payload.state === 'string' ? payload.state : '';
+    return {
+      title: deleteAfterStop ? 'Удаление запланировано' : 'Остановка запрошена',
+      summary: deleteAfterStop
+        ? 'Задача будет удалена после ближайшей безопасной точки остановки.'
+        : 'Выполнение будет остановлено после ближайшей безопасной точки.',
+      facts: [
+        { label: 'state', value: state ? getStateLabel(state) : '' },
+        { label: 'after stop', value: deleteAfterStop ? 'delete' : 'keep' },
+      ],
+      raw: payload,
+    };
+  }
+  if (event.message === 'task_stopped') {
+    const reason = payload && typeof payload.reason === 'string' ? payload.reason : '';
+    const deleteAfterStop = payload && payload.deleteAfterStop === true;
+    return {
+      title: deleteAfterStop ? 'Задача остановлена перед удалением' : 'Задача остановлена',
+      summary: reason || 'Исполнение остановлено на безопасной границе.',
+      facts: [
+        { label: 'after stop', value: deleteAfterStop ? 'delete' : 'keep' },
+      ],
+      raw: payload,
+    };
+  }
   if (event.message === 'run_completed') {
     return {
       title: 'Run завершён',
@@ -801,10 +856,15 @@ function renderTasks(tasks) {
   return filteredTasks
     .map((task) => {
       const selected = task.id === state.selectedTaskId ? ' selected' : '';
+      const stopPending = isTaskStopPending(task);
+      const deletePending = isTaskDeletePending(task);
       const stopButton = isTaskStoppable(task)
-        ? '<button type="button" class="button warning task-stop-button" data-task-stop-id="' + escapeHtml(task.id) + '">' + escapeHtml(copy.stopTask) + '</button>'
+        ? '<button type="button" class="button warning task-stop-button" data-task-stop-id="' + escapeHtml(task.id) + '"' + (stopPending ? ' disabled' : '') + '>' + escapeHtml(stopPending ? copy.stopRequested : copy.stopTask) + '</button>'
         : '';
-      const deleteButton = '<button type="button" class="button danger task-delete-button" data-task-delete-id="' + escapeHtml(task.id) + '">' + escapeHtml(copy.deleteTask) + '</button>';
+      const deleteButton = '<button type="button" class="button danger task-delete-button" data-task-delete-id="' + escapeHtml(task.id) + '"' + (deletePending ? ' disabled' : '') + '>' + escapeHtml(deletePending ? copy.deleteRequested : copy.deleteTask) + '</button>';
+      const controlMeta = stopPending
+        ? '<div class="meta">' + escapeHtml(deletePending ? copy.deleteRequested : copy.stopRequested) + '</div>'
+        : '';
       return [
         '<article class="card task-card' + selected + '">',
         '<button type="button" class="task-card-main" data-task-id="' + escapeHtml(task.id) + '">',
@@ -816,6 +876,7 @@ function renderTasks(tasks) {
         renderPill(getStateLabel(task.state), getStateTone(task.state)),
         '</div>',
         '<div class="meta">target: ' + escapeHtml(task.target_id) + '</div>',
+        controlMeta,
         '<div class="meta">' + escapeHtml(formatRelativeTime(task.updated_at)) + '</div>',
         '</button>',
         '<div class="task-card-actions">' + stopButton + deleteButton + '</div>',
@@ -961,60 +1022,6 @@ function renderMetrics(metrics) {
   ].join('');
 }
 
-function parsePinoLevel(value) {
-  if (typeof value === 'number') {
-    if (value >= 50) {
-      return 'error';
-    }
-    if (value >= 40) {
-      return 'warning';
-    }
-    return 'info';
-  }
-  return 'info';
-}
-
-function parseLogEntries(logs) {
-  if (!logs || typeof logs.content !== 'string' || logs.content.length === 0) {
-    return [];
-  }
-  return logs.content
-    .split('\\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => {
-      const parsed = parseJson(line);
-      if (!parsed || typeof parsed !== 'object') {
-        return {
-          title: 'Runtime log',
-          summary: line,
-          level: 'info',
-          time: '',
-          details: null,
-        };
-      }
-      const title = typeof parsed.msg === 'string'
-        ? parsed.msg
-        : typeof parsed.message === 'string'
-          ? parsed.message
-          : 'Runtime log';
-      const time = typeof parsed.time === 'number'
-        ? formatDateTime(new Date(parsed.time).toISOString())
-        : typeof parsed.time === 'string'
-          ? formatDateTime(parsed.time)
-          : '';
-      const detailEntries = Object.entries(parsed).filter((entry) => !['msg', 'message', 'level', 'time'].includes(entry[0]));
-      const detailObject = Object.fromEntries(detailEntries);
-      return {
-        title,
-        summary: detailEntries.length > 0 ? 'Системное сообщение runtime.' : '',
-        level: parsePinoLevel(parsed.level),
-        time,
-        details: Object.keys(detailObject).length > 0 ? detailObject : null,
-      };
-    });
-}
-
 ${dashboardArtifactViewsScript}
 ${dashboardTaskViewsScript}
 
@@ -1041,7 +1048,7 @@ function renderShell() {
     '<h2>' + escapeHtml(copy.createTask) + '</h2>',
     '<button id="refreshButton" type="button" class="button secondary">' + escapeHtml(copy.refreshButton) + '</button>',
     '</div>',
-    '<div class="field"><label>' + escapeHtml(copy.goalLabel) + '</label><textarea id="goalInput" placeholder="Например: Проанализируй bounded tools для twilx"></textarea></div>',
+    '<div class="field"><label>' + escapeHtml(copy.goalLabel) + '</label><textarea id="goalInput" placeholder="' + escapeHtml(copy.goalPlaceholder) + '"></textarea></div>',
     '<div class="field"><label>' + escapeHtml(copy.targetLabel) + '</label><select id="targetSelect"></select></div>',
     '<button id="createTaskButton" type="button" class="button">' + escapeHtml(copy.createButton) + '</button>',
     '</section>',
@@ -1085,6 +1092,7 @@ function renderShell() {
     '<section id="viewContent" class="stack"></section>',
     '</main>',
     '</div>',
+    '<div id="dialogRoot"></div>',
   ].join('');
 
   bindShellEvents();
@@ -1243,6 +1251,24 @@ function bindShellEvents() {
         persistUiState('push');
         void refreshDashboard({ showLoading: false, force: true });
       }
+      return;
+    }
+
+    const dialogCancelNode = event.target.closest('[data-dialog-cancel]');
+    if (dialogCancelNode instanceof HTMLElement) {
+      closeDialog(false);
+      return;
+    }
+
+    const dialogConfirmNode = event.target.closest('[data-dialog-confirm]');
+    if (dialogConfirmNode instanceof HTMLElement) {
+      closeDialog(true);
+      return;
+    }
+
+    const dialogDismissNode = event.target.closest('[data-dialog-dismiss]');
+    if (dialogDismissNode instanceof HTMLElement && event.target === dialogDismissNode) {
+      closeDialog(false);
     }
   });
 
@@ -1275,6 +1301,10 @@ function bindShellEvents() {
         state.artifactCursor = '';
       }
     persistUiState();
+    if (filterType === 'artifact-run' || filterType === 'artifact-type') {
+      void refreshDashboard({ showLoading: false, force: true });
+      return;
+    }
     if (state.lastLoadedData) {
       updateViewContent(state.lastLoadedData);
     }
@@ -1296,6 +1326,23 @@ function bindShellEvents() {
       }
     });
   }
+
+  document.addEventListener('keydown', (event) => {
+    if (!dialogState.open) {
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeDialog(false);
+      return;
+    }
+
+    if (event.key === 'Enter' && !(event.target instanceof HTMLTextAreaElement)) {
+      event.preventDefault();
+      closeDialog(true);
+    }
+  });
 
 }
 
@@ -1368,7 +1415,14 @@ async function runTaskAction(taskId, action) {
 }
 
 async function deleteTask(taskId) {
-  if (!window.confirm(copy.deleteTaskConfirm)) {
+  const confirmed = await openConfirmDialog({
+    title: copy.deleteTaskTitle,
+    message: copy.deleteTaskConfirm,
+    confirmLabel: copy.deleteTask,
+    cancelLabel: copy.cancelAction,
+    tone: 'danger',
+  });
+  if (!confirmed) {
     return;
   }
 
@@ -1399,7 +1453,14 @@ async function deleteTask(taskId) {
 }
 
 async function deleteAllTasks() {
-  if (!window.confirm(copy.deleteAllTasksConfirm)) {
+  const confirmed = await openConfirmDialog({
+    title: copy.deleteAllTasksTitle,
+    message: copy.deleteAllTasksConfirm,
+    confirmLabel: copy.deleteAllTasks,
+    cancelLabel: copy.cancelAction,
+    tone: 'danger',
+  });
+  if (!confirmed) {
     return;
   }
 
@@ -1428,7 +1489,14 @@ async function deleteAllTasks() {
 }
 
 async function stopTask(taskId) {
-  if (!window.confirm(copy.stopTaskConfirm)) {
+  const confirmed = await openConfirmDialog({
+    title: copy.stopTaskTitle,
+    message: copy.stopTaskConfirm,
+    confirmLabel: copy.stopTask,
+    cancelLabel: copy.cancelAction,
+    tone: 'warning',
+  });
+  if (!confirmed) {
     return;
   }
 
@@ -1447,7 +1515,14 @@ async function stopTask(taskId) {
 }
 
 async function stopAllTasks() {
-  if (!window.confirm(copy.stopAllTasksConfirm)) {
+  const confirmed = await openConfirmDialog({
+    title: copy.stopAllTasksTitle,
+    message: copy.stopAllTasksConfirm,
+    confirmLabel: copy.stopAllTasks,
+    cancelLabel: copy.cancelAction,
+    tone: 'warning',
+  });
+  if (!confirmed) {
     return;
   }
 
@@ -1569,16 +1644,6 @@ async function loadDashboardData() {
     }
   }
 
-  if (state.activeView === 'artifacts' && state.selectedArtifactId) {
-    artifactContent = await fetchJson('/artifacts/' + encodeURIComponent(state.selectedArtifactId) + '/view');
-    if (artifactContent && artifactContent.artifact && typeof artifactContent.artifact.taskId === 'string') {
-      state.selectedTaskId = artifactContent.artifact.taskId;
-    }
-    if (artifactContent && artifactContent.artifact && typeof artifactContent.artifact.runId === 'string') {
-      state.selectedRunId = artifactContent.artifact.runId;
-    }
-  }
-
   const query = new URLSearchParams();
   if (state.selectedTaskId) {
     query.set('taskId', state.selectedTaskId);
@@ -1687,12 +1752,18 @@ async function loadDashboardData() {
     state.selectedArtifactId = '';
   }
 
-  if (state.activeView === 'artifacts' && state.selectedArtifactId && artifactContent === null) {
+  if (state.activeView === 'artifacts' && state.selectedArtifactId) {
     artifactContent = await fetchJson('/artifacts/' + encodeURIComponent(state.selectedArtifactId) + '/view');
+    if (artifactContent && artifactContent.artifact && typeof artifactContent.artifact.taskId === 'string') {
+      state.selectedTaskId = artifactContent.artifact.taskId;
+    }
+    if (artifactContent && artifactContent.artifact && typeof artifactContent.artifact.runId === 'string') {
+      state.selectedRunId = artifactContent.artifact.runId;
+    }
   }
 
   if (state.activeView === 'logs') {
-    logs = await fetchJson('/logs/runtime?tail=400');
+    logs = await fetchJson('/logs/runtime/view?limit=200');
   }
 
   return {
