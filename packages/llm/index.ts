@@ -326,8 +326,8 @@ function createHeuristicPlan(goal: string): TaskPlan {
     steps.push({
       tool: 'shell.exec',
       input: {
-        command: 'pwd',
-        args: [],
+        command: 'ls',
+        args: ['.'],
       },
       expected: { success: true },
       rationale: 'Run the explicitly requested shell command.',

@@ -69,6 +69,7 @@ const dashboardFilterQuerySchema = z.object({
   taskState: taskStateSchema.optional(),
   approvalStatus: approvalStatusSchema.optional(),
   eventLevel: eventLevelSchema.optional(),
+  targetId: z.string().min(1).optional(),
   runLimit: z.number().int().positive().max(100).optional(),
   runOffset: z.number().int().nonnegative().optional(),
 });
@@ -126,6 +127,7 @@ function parseDashboardFilterQuery(requestUrl: URL): z.infer<typeof dashboardFil
     taskState: taskStateValue ? taskStateSchema.parse(taskStateValue) : undefined,
     approvalStatus: approvalStatusValue ? approvalStatusSchema.parse(approvalStatusValue) : undefined,
     eventLevel: eventLevelValue ? eventLevelSchema.parse(eventLevelValue) : undefined,
+    targetId: requestUrl.searchParams.get('targetId') ?? undefined,
     runLimit: requestUrl.searchParams.get('runLimit') ? Number(requestUrl.searchParams.get('runLimit')) : undefined,
     runOffset: requestUrl.searchParams.get('runOffset') ? Number(requestUrl.searchParams.get('runOffset')) : undefined,
   });
@@ -242,10 +244,15 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
       }
 
       if (request.method === 'GET' && requestUrl.pathname === '/health') {
+        const executionSurface = runtime.getExecutionSurface();
         sendJson(response, 200, {
           status: 'ok',
           mode: config.mode,
           autonomy: config.autonomy.mode,
+          executionProfile: executionSurface.profile,
+          targetId: executionSurface.targetId,
+          searchEnabled: executionSurface.searchEnabled,
+          shellEnabled: executionSurface.shellEnabled,
         });
         return;
       }
@@ -259,6 +266,11 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
         const taskId = requestUrl.searchParams.get('taskId');
         const filters = parseDashboardFilterQuery(requestUrl);
         const allTasks = runtime.listTasks();
+        const selectedTaskTargetId =
+          taskId && allTasks.some((task) => task.id === taskId)
+            ? allTasks.find((task) => task.id === taskId)?.target_id
+            : undefined;
+        const executionSurface = runtime.getExecutionSurface(filters.targetId ?? selectedTaskTargetId);
         const tasks = filterTasksByState(allTasks, filters.taskState);
         const taskControlStates = runtime.listTaskControlStates(tasks.map((task) => task.id));
         const approvals = filterApprovalsByStatus(runtime.listApprovals(), filters.approvalStatus);
@@ -271,6 +283,10 @@ export function createApiServer(workspaceRoot: string, configOverride?: RuntimeC
             status: 'ok',
             mode: config.mode,
             autonomy: config.autonomy.mode,
+            executionProfile: executionSurface.profile,
+            targetId: executionSurface.targetId,
+            searchEnabled: executionSurface.searchEnabled,
+            shellEnabled: executionSurface.shellEnabled,
           },
           filters: buildDashboardFiltersViewModel(filters),
           selection: buildDashboardSelectionViewModel({

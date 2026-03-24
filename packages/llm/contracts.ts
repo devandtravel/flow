@@ -2,6 +2,7 @@ import { z } from 'zod';
 import {
   criticReviewSchema,
   type CriticReview,
+  type ExecutionProfile,
   type FileSnapshotMemory,
   type MemorySummary,
   type TaskPlan,
@@ -204,7 +205,25 @@ export function buildPlanningPrompt(
   tools: ToolDefinition[],
   extraContext: string,
   exactFileSnapshots: FileSnapshotMemory[],
+  executionProfile: ExecutionProfile,
 ): string {
+  const profileGuidance =
+    executionProfile === 'strict'
+      ? [
+          '- execution profile is strict: require confirmed observations before writes and keep discovery tightly scoped',
+          '- do not use shell.exec for discovery when bounded search, list, or read tools can answer the question',
+        ]
+      : executionProfile === 'aggressive'
+        ? [
+            '- execution profile is aggressive: prioritize fast repository discovery and convergent execution over conservative over-planning',
+            '- when repo.search_text, repo.search_files, or repo.symbol_search can narrow the target quickly, use them early',
+            '- if shell.exec is available in Tools, it may be used for repository-local discovery or diagnostics when bounded discovery is insufficient',
+            '- shell.exec is limited to read-only discovery commands such as rg, fd, find, ls, cat, sed, head, tail, grep, and read-only git inspection',
+          ]
+        : [
+            '- execution profile is balanced: prefer bounded discovery first and use exploratory reads before any write step',
+            '- use repo.search_text, repo.search_files, or repo.symbol_search to narrow unfamiliar code locations before deeper reads',
+          ];
   return [
     `FLOW Contract Version: ${promptContractVersion}`,
     'You are FLOW planner.',
@@ -216,6 +235,7 @@ export function buildPlanningPrompt(
     'If ExtraContext contains recentFailureClasses, interpret them as normalized failure categories and correct the plan accordingly.',
     'If ExtraContext contains doNotRepeatRules, follow them strictly and avoid generating any step that violates those rules.',
     'If Memory.semantic contains file_snapshot entries, treat their content as the exact latest file text for planning edits.',
+    `ExecutionProfile: ${executionProfile}`,
     '',
     `Goal: ${goal}`,
     `ExtraContext: ${extraContext}`,
@@ -240,6 +260,7 @@ export function buildPlanningPrompt(
     '- never output pseudo-types, placeholders, unions, comments, angle brackets, or schema notation inside input_json or expected_json',
     '- match each step input_json exactly to the tool inputContract keys; do not invent field names',
     '- expected_json must describe concrete observable results; use exact literals, booleans, or numbers, and do not use placeholder values such as "string"',
+    '- shell.exec is reserved for repository-local read-only discovery and diagnostics; never use shell.exec to write files, patch code, change git state, install packages, or run destructive commands',
     '- for fs.write_file, content must be the complete final file text, not a placeholder such as "string" or a short summary of the intended edit',
     '- for repo.apply_patch, never use guessed context, placeholder lines, ellipses, or synthetic markers',
     '- repo.apply_patch accepts either a valid unified diff or a FLOW patch that begins with "*** Update File:", "*** Add File:", or "*** Delete File:"',
@@ -250,9 +271,11 @@ export function buildPlanningPrompt(
     '- if exact patch context is not yet known, add a read step first instead of guessing the patch',
     '- when a safe append or replacement can be expressed more reliably through fs.read_file plus fs.write_file, prefer that sequence over a speculative patch',
     '- for fs.read_file, expected_json should check a small observable property such as path or content_includes, not the entire file body',
+    '- when the task requires locating code in an unfamiliar repository, prefer repo.search_text, repo.search_files, or repo.symbol_search before hand-built directory guessing',
     '- when discovering code locations, do not plan reads or patches against guessed child paths; every path segment beyond an observed directory must come from an earlier observation step or ExactFileSnapshots',
     '- if you only know a directory, the next discovery step may inspect only that exact confirmed directory; do not jump directly to guessed descendants such as landing, buy-button.tsx, index.tsx, or similar names',
     '- if a path candidate has not been observed yet, add a new observation step to confirm it before any fs.read_file, fs.write_file, or repo.apply_patch step that depends on it',
+    ...profileGuidance,
   ].join('\n');
 }
 
@@ -260,7 +283,14 @@ export function buildCriticPrompt(
   plan: TaskPlan,
   tools: ToolDefinition[],
   exactFileSnapshots: FileSnapshotMemory[],
+  executionProfile: ExecutionProfile,
 ): string {
+  const profileGuidance =
+    executionProfile === 'aggressive'
+      ? 'Execution profile is aggressive. Exploratory discovery chains that use search, list, or read steps to locate code before the final write are valid and should not be rejected for incompleteness alone.'
+      : executionProfile === 'strict'
+        ? 'Execution profile is strict. Prefer plans that minimize speculative discovery breadth and keep every dependent path tightly grounded in prior observations.'
+        : 'Execution profile is balanced. Prefer bounded discovery before writes and reject plans only when they are invalid, not merely incomplete before observation.';
   return [
     `FLOW Contract Version: ${promptContractVersion}`,
     'You are FLOW critic.',
@@ -270,6 +300,8 @@ export function buildCriticPrompt(
     'A write-capable step is valid when it uses an allowed FLOW tool and follows the task constraints.',
     'If ExactFileSnapshots contains the current exact file text for a target file, a full fs.write_file rewrite derived from that snapshot is valid and preferred over a speculative patch.',
     'Do not reject fs.write_file solely because it writes the whole file when that file is already present in ExactFileSnapshots for this task.',
+    `ExecutionProfile: ${executionProfile}`,
+    profileGuidance,
     `Plan: ${JSON.stringify(plan)}`,
     `AvailableTools: ${JSON.stringify(sanitizeToolCatalog(tools))}`,
     `ExactFileSnapshots: ${formatExactFileSnapshots(exactFileSnapshots)}`,

@@ -7,6 +7,8 @@ workspace:
     - .
   write_paths:
     - .
+execution:
+  profile: aggressive
 targets:
   - id: example-project
     root: /var/lib/flow-agent/targets/example-project
@@ -20,6 +22,7 @@ targets:
       - git.status
       - git.branch
       - git.commit
+      - repo.search
       - repo.test
       - repo.build
       - repo.check
@@ -32,6 +35,7 @@ capabilities:
     - git.status
     - git.branch
     - git.commit
+    - repo.search
     - repo.test
     - repo.build
     - repo.check

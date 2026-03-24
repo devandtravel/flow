@@ -1,4 +1,5 @@
 import type { ToolStep } from '../../domain';
+import { getShellDiscoveryValidationError } from '../../policy/shell-discovery';
 
 const reservedPlaceholderValues = new Set([
   'string',
@@ -19,7 +20,8 @@ function isPlaceholderString(value: string): boolean {
 }
 
 function isTemplatePlaceholderString(value: string): boolean {
-  return /^<[^>]*\s+[^>]*>$/.test(value.trim());
+  const normalized = value.trim();
+  return /^<[^>]*\s+[^>]*>$/.test(normalized) || (normalized.startsWith('<') && normalized.endsWith('>'));
 }
 
 function containsPlaceholderValue(value: unknown): boolean {
@@ -55,6 +57,10 @@ function getWriteFileContentValidationError(step: ToolStep): string | undefined 
 
   if (/^updated .+ content\b/.test(normalizedContent)) {
     return 'content must contain the final file body, not a summary of the intended change.';
+  }
+
+  if (isTemplatePlaceholderString(content)) {
+    return 'content must contain the exact final file body, not a template placeholder.';
   }
 
   return undefined;
@@ -108,10 +114,29 @@ function getPatchValidationError(step: ToolStep): string | undefined {
   return undefined;
 }
 
+function getShellExecValidationError(step: ToolStep): string | undefined {
+  if (step.tool !== 'shell.exec') {
+    return undefined;
+  }
+
+  const command = step.input['command'];
+  const args = step.input['args'];
+  if (typeof command !== 'string') {
+    return 'command must be a string.';
+  }
+
+  if (!Array.isArray(args) || args.some((argument) => typeof argument !== 'string')) {
+    return 'args must be an array of strings.';
+  }
+
+  return getShellDiscoveryValidationError(command, args);
+}
+
 export function getStepSemanticValidationError(step: ToolStep): string | undefined {
   return (
     getWriteFileContentValidationError(step) ??
     getExpectedValidationError(step) ??
-    getPatchValidationError(step)
+    getPatchValidationError(step) ??
+    getShellExecValidationError(step)
   );
 }

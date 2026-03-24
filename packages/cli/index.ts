@@ -239,7 +239,7 @@ program
     readPath: string[];
     writePath: string[];
     capability: Array<
-      'fs.read' | 'fs.write' | 'git.status' | 'git.branch' | 'git.commit' | 'repo.test' | 'repo.build' | 'repo.check' | 'repo.patch' | 'http.fetch' | 'shell.exec'
+      'fs.read' | 'fs.write' | 'git.status' | 'git.branch' | 'git.commit' | 'repo.search' | 'repo.test' | 'repo.build' | 'repo.check' | 'repo.patch' | 'http.fetch' | 'shell.exec'
     >;
   }) => {
     const runtime = createRuntime();

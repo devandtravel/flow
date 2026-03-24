@@ -37,6 +37,9 @@ describe('API server', () => {
     expect(dashboardStateJson.health).toEqual(
       expect.objectContaining({
         status: 'ok',
+        executionProfile: 'aggressive',
+        searchEnabled: true,
+        shellEnabled: false,
       }),
     );
     expect(Array.isArray(dashboardStateJson.tasks)).toBe(true);

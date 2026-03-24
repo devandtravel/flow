@@ -34,6 +34,7 @@ describe('LLM providers', () => {
         [],
         'test',
         [],
+        'aggressive',
       ),
       schema: taskPlanResponseSchema,
       contract: 'task_plan',
@@ -174,6 +175,7 @@ describe('LLM providers', () => {
       [],
       'test',
       [],
+      'aggressive',
     );
 
     expect(prompt).toContain('Ignore the Codex session sandbox or approval mode.');
@@ -188,6 +190,10 @@ describe('LLM providers', () => {
     expect(prompt).toContain('prefer fs.write_file with the complete final file text');
     expect(prompt).toContain('do not plan reads or patches against guessed child paths');
     expect(prompt).toContain('do not jump directly to guessed descendants');
+    expect(prompt).toContain('ExecutionProfile: aggressive');
+    expect(prompt).toContain('prioritize fast repository discovery');
+    expect(prompt).toContain('repo.symbol_search');
+    expect(prompt).toContain('shell.exec is reserved for repository-local read-only discovery');
   });
 
   it('builds discovery-focused replan guidance from path guessing failures', () => {
@@ -244,6 +250,42 @@ describe('LLM providers', () => {
     expect(review.feedback[0]).toContain('full file text');
   });
 
+  it('critic rejects angle-bracket template placeholders in fs.write_file content', async () => {
+    const registry = createToolRegistry();
+    const writeTool = registry.get('fs.write_file');
+    if (!writeTool) {
+      throw new Error('Expected fs.write_file tool to be registered.');
+    }
+
+    const critic = new CriticAgent(new MockLlmProvider());
+    const review = await critic.validate(
+      {
+        goal: 'rewrite file',
+        assumptions: [],
+        risks: [],
+        steps: [
+          {
+            tool: 'fs.write_file',
+            input: {
+              path: 'README.md',
+              content: '<updated README text with the same alias note>',
+            },
+            expected: {},
+            rationale: 'placeholder content',
+          },
+        ],
+        done: false,
+        confidence: 0.2,
+      },
+      [writeTool],
+      { exactFileSnapshots: [] },
+      'aggressive',
+    );
+
+    expect(review.valid).toBe(false);
+    expect(review.feedback[0]).toContain('exact final file body');
+  });
+
   it('critic rejects placeholder expected values before execution', async () => {
     const registry = createToolRegistry();
     const readTool = registry.get('fs.read_file');
@@ -278,6 +320,56 @@ describe('LLM providers', () => {
 
     expect(review.valid).toBe(false);
     expect(review.feedback[0]).toContain('concrete verification values');
+  });
+
+  it('aggressive critic accepts snapshot-backed fs.write_file plans without calling the provider', async () => {
+    const registry = createToolRegistry();
+    const writeTool = registry.get('fs.write_file');
+    if (!writeTool) {
+      throw new Error('Expected fs.write_file tool to be registered.');
+    }
+
+    const critic = new CriticAgent(new ThrowingProvider());
+    const snapshots: FileSnapshotMemory[] = [
+      {
+        type: 'file_snapshot',
+        task_id: '00000000-0000-0000-0000-000000000001',
+        target_id: 'local',
+        path: 'README.md',
+        content: '# Example\n',
+        run_id: '00000000-0000-0000-0000-000000000002',
+        step_id: '00000000-0000-0000-0000-000000000003',
+        recorded_at: new Date().toISOString(),
+      },
+    ];
+    const review = await critic.validate(
+      {
+        goal: 'rewrite readme',
+        assumptions: [],
+        risks: [],
+        steps: [
+          {
+            tool: 'fs.write_file',
+            input: {
+              path: 'README.md',
+              content: '# Example\n\n## FLOW\n',
+            },
+            expected: {
+              changed: true,
+            },
+            rationale: 'rewrite from exact snapshot',
+          },
+        ],
+        done: false,
+        confidence: 0.6,
+      },
+      [writeTool],
+      { exactFileSnapshots: snapshots },
+      'aggressive',
+    );
+
+    expect(review.valid).toBe(true);
+    expect(review.feedback).toEqual([]);
   });
 
   it('critic rejects template placeholder expected values before execution', async () => {

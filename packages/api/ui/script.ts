@@ -249,6 +249,19 @@ function formatJson(value) {
   return escapeHtml(JSON.stringify(value, null, 2));
 }
 
+function getExecutionProfileLabel(profile) {
+  const labels = {
+    strict: copy.profileStrict,
+    balanced: copy.profileBalanced,
+    aggressive: copy.profileAggressive,
+  };
+  return labels[profile] || String(profile || copy.profileUnknown);
+}
+
+function getCapabilityStateLabel(enabled, positiveLabel, negativeLabel) {
+  return enabled === true ? positiveLabel : negativeLabel;
+}
+
 function getElement(id) {
   const element = document.getElementById(id);
   if (!element) {
@@ -1078,6 +1091,9 @@ function renderShell() {
     '<div class="kpi-grid">',
     '<div class="kpi"><div class="meta">mode</div><div id="kpiMode" class="kpi-value"></div></div>',
     '<div class="kpi"><div class="meta">autonomy</div><div id="kpiAutonomy" class="kpi-value"></div></div>',
+    '<div class="kpi"><div class="meta">' + escapeHtml(copy.executionProfile) + '</div><div id="kpiProfile" class="kpi-value"></div></div>',
+    '<div class="kpi"><div class="meta">' + escapeHtml(copy.discoveryReadiness) + '</div><div id="kpiDiscovery" class="kpi-value"></div></div>',
+    '<div class="kpi"><div class="meta">' + escapeHtml(copy.shellReadiness) + '</div><div id="kpiShell" class="kpi-value"></div></div>',
     '<div class="kpi"><div class="meta">tasks</div><div id="kpiTasks" class="kpi-value"></div></div>',
     '<div class="kpi"><div class="meta">ожидающие подтверждения</div><div id="kpiApprovals" class="kpi-value"></div></div>',
     '</div>',
@@ -1598,7 +1614,14 @@ function updateStatusBar(tasks, health) {
     selectedTask ? renderPill(getStateLabel(selectedTask.state), getStateTone(selectedTask.state)) : renderPill('None', ''),
   );
   setText('statusLastUpdated', state.lastUpdatedAt ? formatRelativeTime(state.lastUpdatedAt) : 'waiting');
-  setText('statusDetail', copy.heroSubtitle);
+  setText(
+    'statusDetail',
+    [
+      getExecutionProfileLabel(health.executionProfile),
+      getCapabilityStateLabel(health.searchEnabled, copy.discoveryEnabled, copy.discoveryDisabled),
+      getCapabilityStateLabel(health.shellEnabled, copy.shellEnabled, copy.shellDisabled),
+    ].join(' · '),
+  );
 }
 
 function updateTabs() {
@@ -1647,6 +1670,9 @@ async function loadDashboardData() {
   const query = new URLSearchParams();
   if (state.selectedTaskId) {
     query.set('taskId', state.selectedTaskId);
+  }
+  if (state.targetId) {
+    query.set('targetId', state.targetId);
   }
   if (state.taskFilter) {
     query.set('taskState', state.taskFilter);
@@ -1785,7 +1811,15 @@ function updateViewContent(loadedData) {
   const schedules = Array.isArray(dashboard.schedules) ? dashboard.schedules : [];
   const health = dashboard.health && typeof dashboard.health === 'object'
     ? dashboard.health
-    : { status: 'unknown', mode: 'unknown', autonomy: 'unknown' };
+    : {
+        status: 'unknown',
+        mode: 'unknown',
+        autonomy: 'unknown',
+        executionProfile: 'unknown',
+        targetId: '',
+        searchEnabled: false,
+        shellEnabled: false,
+      };
 
   if (!state.selectedRunId && loadedData.taskView && Array.isArray(loadedData.taskView.runs) && loadedData.taskView.runs[0]) {
     state.selectedRunId = loadedData.taskView.runs[0].run.id;
@@ -1804,6 +1838,9 @@ function updateViewContent(loadedData) {
 
   setText('kpiMode', String(health.mode));
   setText('kpiAutonomy', String(health.autonomy));
+  setText('kpiProfile', getExecutionProfileLabel(health.executionProfile));
+  setText('kpiDiscovery', getCapabilityStateLabel(health.searchEnabled, copy.discoveryEnabledShort, copy.discoveryDisabledShort));
+  setText('kpiShell', getCapabilityStateLabel(health.shellEnabled, copy.shellEnabledShort, copy.shellDisabledShort));
   setText('kpiTasks', String(tasks.length));
   setText('kpiApprovals', String(approvals.filter((approval) => approval.status === 'pending').length));
 

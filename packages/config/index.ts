@@ -6,6 +6,7 @@ import { z } from 'zod';
 import {
   autonomyModeSchema,
   capabilityNameSchema,
+  executionProfileSchema,
   llmProviderNameSchema,
   runtimeModeSchema,
   scheduleConfigSchema,
@@ -44,6 +45,10 @@ const workspaceConfigSchema = z.object({
   write_paths: z.array(z.string().min(1)).min(1),
 });
 
+const executionConfigSchema = z.object({
+  profile: executionProfileSchema.default('aggressive'),
+});
+
 const llmConfigSchema = z.object({
   provider: llmProviderNameSchema.default('codex'),
   model: z.string().min(1).default('gpt-5-codex'),
@@ -76,6 +81,7 @@ export const runtimeConfigSchema = z.object({
     root: z.string().min(1),
   }),
   workspace: workspaceConfigSchema,
+  execution: executionConfigSchema,
   targets: z.array(targetConfigSchema).default([]),
   capabilities: capabilityConfigSchema,
   policies: policyConfigSchema,
@@ -115,6 +121,7 @@ function createDefaultTargets(workspaceRoot: string, mode: z.infer<typeof runtim
           'git.status',
           'git.branch',
           'git.commit',
+          'repo.search',
           'repo.test',
           'repo.build',
           'repo.check',
@@ -137,6 +144,7 @@ function createDefaultTargets(workspaceRoot: string, mode: z.infer<typeof runtim
         'git.status',
         'git.branch',
         'git.commit',
+        'repo.search',
         'repo.test',
         'repo.build',
         'repo.check',
@@ -145,6 +153,16 @@ function createDefaultTargets(workspaceRoot: string, mode: z.infer<typeof runtim
       ],
     },
   ];
+}
+
+function mergeUniqueCapabilities(values: readonly z.infer<typeof capabilityNameSchema>[][]): z.infer<typeof capabilityNameSchema>[] {
+  const merged = new Set<z.infer<typeof capabilityNameSchema>>();
+  for (const group of values) {
+    for (const capability of group) {
+      merged.add(capability);
+    }
+  }
+  return [...merged];
 }
 
 export function buildDefaultConfig(workspaceRoot: string, mode: z.infer<typeof runtimeModeSchema>): RuntimeConfig {
@@ -157,6 +175,9 @@ export function buildDefaultConfig(workspaceRoot: string, mode: z.infer<typeof r
       read_paths: ['.'],
       write_paths: ['.'],
     },
+    execution: {
+      profile: 'aggressive',
+    },
     targets: defaultTargets,
     capabilities: {
       enabled: [
@@ -165,6 +186,7 @@ export function buildDefaultConfig(workspaceRoot: string, mode: z.infer<typeof r
         'git.status',
         'git.branch',
         'git.commit',
+        'repo.search',
         'repo.test',
         'repo.build',
         'repo.check',
@@ -300,7 +322,20 @@ function mergeTargets(
     return defaultTargets;
   }
 
-  return parsedTargets;
+  const parsedTargetList = z.array(targetConfigSchema).parse(parsedTargets);
+  const defaultTargetsById = new Map(defaultTargets.map((target) => [target.id, target]));
+
+  return parsedTargetList.map((target) => {
+    const defaultTarget = defaultTargetsById.get(target.id);
+    if (!defaultTarget) {
+      return target;
+    }
+
+    return {
+      ...target,
+      capabilities: mergeUniqueCapabilities([defaultTarget.capabilities, target.capabilities]),
+    };
+  });
 }
 
 export function loadConfig(workspaceRoot: string, configPath = getConfigPath(workspaceRoot)): RuntimeConfig {
@@ -331,10 +366,22 @@ export function loadConfig(workspaceRoot: string, configPath = getConfigPath(wor
       ...(parsed && typeof parsed === 'object' && 'workspace' in parsed ? parsed.workspace : {}),
       root: workspaceRoot,
     },
+    execution: {
+      ...defaults.execution,
+      ...(parsed && typeof parsed === 'object' && 'execution' in parsed ? parsed.execution : {}),
+    },
     targets: mergeTargets(workspaceRoot, parsed && typeof parsed === 'object' && 'targets' in parsed ? parsed.targets : [], mode),
     capabilities: {
       ...defaults.capabilities,
       ...(parsed && typeof parsed === 'object' && 'capabilities' in parsed ? parsed.capabilities : {}),
+      enabled: mergeUniqueCapabilities([
+        defaults.capabilities.enabled,
+        z.array(capabilityNameSchema).parse(
+          parsed && typeof parsed === 'object' && 'capabilities' in parsed && parsed.capabilities && typeof parsed.capabilities === 'object' && 'enabled' in parsed.capabilities
+            ? parsed.capabilities.enabled
+            : [],
+        ),
+      ]),
     },
     policies: {
       ...defaults.policies,

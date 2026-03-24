@@ -168,6 +168,13 @@ export interface MaintenanceSummary {
   latestEvent: MaintenanceEventRecord | null;
 }
 
+export interface ExecutionSurfaceSummary {
+  profile: RuntimeConfig['execution']['profile'];
+  targetId: string | null;
+  searchEnabled: boolean;
+  shellEnabled: boolean;
+}
+
 export type TaskOperatorAction =
   | 'retry'
   | 'replan'
@@ -510,6 +517,21 @@ export class AgentRuntime {
     return this.cleanupState({
       trigger: options?.trigger ?? 'worker_due',
     });
+  }
+
+  getExecutionSurface(targetId?: string): ExecutionSurfaceSummary {
+    const availableTargets = this.listTargets();
+    const resolvedTarget =
+      (targetId ? availableTargets.find((candidate) => candidate.id === targetId) : undefined) ??
+      availableTargets[0] ??
+      null;
+    const capabilities = resolvedTarget?.capabilities ?? [];
+    return {
+      profile: this.config.execution.profile,
+      targetId: resolvedTarget?.id ?? null,
+      searchEnabled: capabilities.includes('repo.search'),
+      shellEnabled: capabilities.includes('shell.exec'),
+    };
   }
 
   private targetRecordToConfig(record: TargetRecord): TargetConfig {
@@ -1089,12 +1111,15 @@ export class AgentRuntime {
       memory,
       tools: toolCatalog,
       signal,
+      executionProfile: this.config.execution.profile,
       extraContext: JSON.stringify({
         target: {
           id: target.id,
           root: target.root,
         },
         autonomy: this.config.autonomy.mode,
+        executionProfile: this.config.execution.profile,
+        targetCapabilities: target.capabilities,
         exactFileSnapshotPaths: exactFileSnapshots.map((snapshot) => snapshot.path),
         recentFailureHints,
         recentFailureClasses: replanGuidance.failureClasses,
@@ -1940,6 +1965,7 @@ export class AgentRuntime {
               {
                 exactFileSnapshots: this.memory.getTaskFileSnapshots(task.id),
               },
+              this.config.execution.profile,
               signal,
             ),
           );

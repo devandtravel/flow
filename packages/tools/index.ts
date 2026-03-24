@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { capabilityNameSchema } from '../domain';
 import { ValidationError } from '../errors';
 import type { PolicyEngine } from '../policy';
+import { getShellDiscoveryValidationError } from '../policy/shell-discovery';
 import { applyFlowPatch, getFlowPatchChangedFiles, isFlowPatchFormat } from './flow-patch';
 
 export const directoryEntrySchema = z.object({
@@ -158,6 +159,25 @@ const listDirectoryInputSchema = z.object({
   path: z.string().default('.'),
 });
 
+const searchTextInputSchema = z.object({
+  query: z.string().min(1),
+  path: z.string().default('.'),
+  max_results: z.number().int().positive().max(200).default(20),
+});
+
+const searchFilesInputSchema = z.object({
+  pattern: z.string().min(1),
+  path: z.string().default('.'),
+  max_results: z.number().int().positive().max(200).default(50),
+});
+
+const symbolSearchInputSchema = z.object({
+  symbol: z.string().min(1),
+  path: z.string().default('.'),
+  mode: z.enum(['definition', 'reference', 'any']).default('definition'),
+  max_results: z.number().int().positive().max(200).default(20),
+});
+
 const gitBranchInputSchema = z.object({
   branch: z.string().regex(/^[A-Za-z0-9._/-]+$/),
 });
@@ -179,6 +199,117 @@ const shellInputSchema = z.object({
   command: z.string().min(1),
   args: z.array(z.string()).default([]),
 });
+
+const rgJsonLineSchema = z.object({
+  type: z.string(),
+  data: z.record(z.string(), z.unknown()).optional(),
+});
+
+const rgMatchPathSchema = z.object({
+  text: z.string(),
+});
+
+const rgMatchLineTextSchema = z.object({
+  text: z.string(),
+});
+
+const rgMatchSubmatchSchema = z.object({
+  match: z.object({
+    text: z.string(),
+  }),
+  start: z.number().int().nonnegative(),
+  end: z.number().int().nonnegative(),
+});
+
+const rgMatchDataSchema = z.object({
+  path: rgMatchPathSchema,
+  lines: rgMatchLineTextSchema,
+  line_number: z.number().int().positive(),
+  submatches: z.array(rgMatchSubmatchSchema),
+});
+
+function isRipgrepAvailable(workspaceRoot: string): boolean {
+  const result = spawnSync('rg', ['--version'], {
+    cwd: workspaceRoot,
+    encoding: 'utf8',
+  });
+  return result.status === 0;
+}
+
+function parseRipgrepMatchLines(stdout: string, limit: number): Array<{
+  path: string;
+  line_number: number;
+  line: string;
+  match: string;
+}> {
+  const matches: Array<{
+    path: string;
+    line_number: number;
+    line: string;
+    match: string;
+  }> = [];
+
+  for (const line of stdout.split('\n')) {
+    const trimmedLine = line.trim();
+    if (trimmedLine.length === 0) {
+      continue;
+    }
+
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(trimmedLine);
+    } catch {
+      continue;
+    }
+
+    const parsedLine = rgJsonLineSchema.safeParse(parsedJson);
+    if (!parsedLine.success || parsedLine.data.type !== 'match' || !parsedLine.data.data) {
+      continue;
+    }
+
+    const parsedMatch = rgMatchDataSchema.safeParse(parsedLine.data.data);
+    if (!parsedMatch.success) {
+      continue;
+    }
+
+    const firstSubmatch = parsedMatch.data.submatches[0];
+    matches.push({
+      path: parsedMatch.data.path.text,
+      line_number: parsedMatch.data.line_number,
+      line: parsedMatch.data.lines.text.trimEnd(),
+      match: firstSubmatch ? firstSubmatch.match.text : '',
+    });
+
+    if (matches.length >= limit) {
+      break;
+    }
+  }
+
+  return matches;
+}
+
+function escapeRipgrepPattern(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function createSymbolSearchPattern(
+  symbol: string,
+  mode: z.infer<typeof symbolSearchInputSchema.shape.mode>,
+): string {
+  const escaped = escapeRipgrepPattern(symbol);
+  if (mode === 'reference' || mode === 'any') {
+    return `\\b${escaped}\\b`;
+  }
+
+  return [
+    `\\b(?:export\\s+)?(?:async\\s+)?function\\s+${escaped}\\b`,
+    `\\b(?:export\\s+)?(?:const|let|var)\\s+${escaped}\\b`,
+    `\\b(?:export\\s+)?class\\s+${escaped}\\b`,
+    `\\b(?:export\\s+)?interface\\s+${escaped}\\b`,
+    `\\b(?:export\\s+)?type\\s+${escaped}\\b`,
+    `\\b(?:export\\s+)?enum\\s+${escaped}\\b`,
+  ].join('|');
+}
 
 export function createToolRegistry(): Map<string, ToolDefinition> {
   const tools: ToolDefinition[] = [
@@ -338,6 +469,194 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
       },
     },
     {
+      name: 'repo.search_text',
+      description: 'Search repository text with ripgrep and return structured matches.',
+      capability: 'repo.search',
+      sideEffectClass: 'read',
+      reversibility: 'reversible',
+      approvalClass: 'never',
+      inputSchema: searchTextInputSchema,
+      inputContract: {
+        query: 'string, required, ripgrep search pattern',
+        path: 'string, optional, workspace-relative search root, defaults to "."',
+        max_results: 'number, optional, maximum matches to return, defaults to 20',
+      },
+      async execute(input, context) {
+        try {
+          const parsed = searchTextInputSchema.parse(input);
+          const searchRoot = resolvePath(context.workspaceRoot, parsed.path);
+          ensureReadable(searchRoot, context.policy);
+          if (!isRipgrepAvailable(context.workspaceRoot)) {
+            return failureResult('ripgrep (rg) is required for repo.search_text.');
+          }
+
+          const result = spawnSync('rg', ['--json', '--line-number', '--color', 'never', '--max-count', String(parsed.max_results), parsed.query, searchRoot], {
+            cwd: context.workspaceRoot,
+            encoding: 'utf8',
+          });
+
+          if (result.status !== 0 && result.status !== 1) {
+            return failureResult(result.stderr || result.stdout || 'repo.search_text failed.', {
+              stdout: result.stdout,
+              stderr: result.stderr,
+              status: result.status,
+            });
+          }
+
+          const matches = parseRipgrepMatchLines(result.stdout, parsed.max_results);
+          return successResult(
+            {
+              query: parsed.query,
+              path: searchRoot,
+              matches,
+              match_count: matches.length,
+            },
+            matches.length > 0
+              ? `Found ${String(matches.length)} text matches for ${parsed.query}.`
+              : `No text matches found for ${parsed.query}.`,
+          );
+        } catch (error) {
+          return failureResult(error instanceof Error ? error.message : 'Unknown repository search error.');
+        }
+      },
+    },
+    {
+      name: 'repo.search_files',
+      description: 'Search repository file paths with ripgrep glob patterns.',
+      capability: 'repo.search',
+      sideEffectClass: 'read',
+      reversibility: 'reversible',
+      approvalClass: 'never',
+      inputSchema: searchFilesInputSchema,
+      inputContract: {
+        pattern: 'string, required, ripgrep glob pattern such as "**/*.tsx" or "*landing*"',
+        path: 'string, optional, workspace-relative search root, defaults to "."',
+        max_results: 'number, optional, maximum paths to return, defaults to 50',
+      },
+      async execute(input, context) {
+        try {
+          const parsed = searchFilesInputSchema.parse(input);
+          const searchRoot = resolvePath(context.workspaceRoot, parsed.path);
+          ensureReadable(searchRoot, context.policy);
+          if (!isRipgrepAvailable(context.workspaceRoot)) {
+            return failureResult('ripgrep (rg) is required for repo.search_files.');
+          }
+
+          const result = spawnSync('rg', ['--files', searchRoot, '-g', parsed.pattern], {
+            cwd: context.workspaceRoot,
+            encoding: 'utf8',
+          });
+
+          if (result.status !== 0 && result.status !== 1) {
+            return failureResult(result.stderr || result.stdout || 'repo.search_files failed.', {
+              stdout: result.stdout,
+              stderr: result.stderr,
+              status: result.status,
+            });
+          }
+
+          const files = result.stdout
+            .split('\n')
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)
+            .slice(0, parsed.max_results);
+
+          return successResult(
+            {
+              pattern: parsed.pattern,
+              path: searchRoot,
+              files,
+              file_count: files.length,
+            },
+            files.length > 0
+              ? `Found ${String(files.length)} file paths for ${parsed.pattern}.`
+              : `No file paths found for ${parsed.pattern}.`,
+          );
+        } catch (error) {
+          return failureResult(error instanceof Error ? error.message : 'Unknown repository file search error.');
+        }
+      },
+    },
+    {
+      name: 'repo.symbol_search',
+      description: 'Search repository code symbols with ripgrep using definition or reference mode.',
+      capability: 'repo.search',
+      sideEffectClass: 'read',
+      reversibility: 'reversible',
+      approvalClass: 'never',
+      inputSchema: symbolSearchInputSchema,
+      inputContract: {
+        symbol: 'string, required, symbol name to search for',
+        path: 'string, optional, workspace-relative search root, defaults to "."',
+        mode: 'string, optional, one of definition, reference, any; defaults to definition',
+        max_results: 'number, optional, maximum matches to return, defaults to 20',
+      },
+      async execute(input, context) {
+        try {
+          const parsed = symbolSearchInputSchema.parse(input);
+          const searchRoot = resolvePath(context.workspaceRoot, parsed.path);
+          ensureReadable(searchRoot, context.policy);
+          if (!isRipgrepAvailable(context.workspaceRoot)) {
+            return failureResult('ripgrep (rg) is required for repo.symbol_search.');
+          }
+
+          const result = spawnSync(
+            'rg',
+            [
+              '--json',
+              '--line-number',
+              '--color',
+              'never',
+              '--max-count',
+              String(parsed.max_results),
+              '--glob',
+              '*.ts',
+              '--glob',
+              '*.tsx',
+              '--glob',
+              '*.js',
+              '--glob',
+              '*.jsx',
+              '--glob',
+              '*.mjs',
+              '--glob',
+              '*.cjs',
+              createSymbolSearchPattern(parsed.symbol, parsed.mode),
+              searchRoot,
+            ],
+            {
+              cwd: context.workspaceRoot,
+              encoding: 'utf8',
+            },
+          );
+
+          if (result.status !== 0 && result.status !== 1) {
+            return failureResult(result.stderr || result.stdout || 'repo.symbol_search failed.', {
+              stdout: result.stdout,
+              stderr: result.stderr,
+              status: result.status,
+            });
+          }
+
+          const matches = parseRipgrepMatchLines(result.stdout, parsed.max_results);
+          return successResult(
+            {
+              symbol: parsed.symbol,
+              mode: parsed.mode,
+              path: searchRoot,
+              matches,
+              match_count: matches.length,
+            },
+            matches.length > 0
+              ? `Found ${String(matches.length)} symbol matches for ${parsed.symbol}.`
+              : `No symbol matches found for ${parsed.symbol}.`,
+          );
+        } catch (error) {
+          return failureResult(error instanceof Error ? error.message : 'Unknown repository symbol search error.');
+        }
+      },
+    },
+    {
       name: 'repo.run_tests',
       description: 'Run the repository test suite.',
       capability: 'repo.test',
@@ -474,7 +793,7 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
     },
     {
       name: 'shell.exec',
-      description: 'Run a bounded shell command when explicitly enabled by capability and policy.',
+      description: 'Run a repository-local read-only discovery command when explicitly enabled by capability and policy.',
       capability: 'shell.exec',
       sideEffectClass: 'execute',
       reversibility: 'irreversible',
@@ -488,6 +807,10 @@ export function createToolRegistry(): Map<string, ToolDefinition> {
         const parsed = shellInputSchema.parse(input);
         if (!statSync(context.workspaceRoot).isDirectory()) {
           return failureResult(`Workspace root ${context.workspaceRoot} is not a directory.`);
+        }
+        const validationError = getShellDiscoveryValidationError(parsed.command, parsed.args);
+        if (validationError) {
+          return failureResult(validationError);
         }
         return runCommand(context.workspaceRoot, parsed.command, parsed.args);
       },

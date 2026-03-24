@@ -110,6 +110,7 @@ describe('AgentRuntime', () => {
     const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-stop-delete-active-'));
     const config = buildDefaultConfig(workspaceRoot, 'project');
     config.autonomy.mode = 'autonomous';
+    config.execution.profile = 'balanced';
 
     const runtime = new AgentRuntime({
       workspaceRoot,
@@ -231,6 +232,7 @@ describe('AgentRuntime', () => {
 
     const config = buildDefaultConfig(workspaceRoot, 'project');
     config.autonomy.mode = 'autonomous';
+    config.execution.profile = 'balanced';
 
     const provider = new SequencedProvider([
       {

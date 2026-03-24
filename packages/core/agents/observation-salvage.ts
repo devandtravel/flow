@@ -20,19 +20,19 @@ export function buildObservationSalvagePlan(
   for (const step of plan.steps) {
     const tool = getToolDefinition(step, availableTools);
     if (!tool) {
-      break;
+      continue;
     }
 
     if (tool.sideEffectClass !== 'read') {
-      break;
+      continue;
     }
 
     if (!tool.inputSchema.safeParse(step.input).success) {
-      break;
+      continue;
     }
 
     if (getStepSemanticValidationError(step) !== undefined) {
-      break;
+      continue;
     }
 
     salvageableSteps.push(step);
@@ -44,6 +44,6 @@ export function buildObservationSalvagePlan(
 
   return {
     steps: salvageableSteps,
-    reason: 'Executing a validated read-only observation prefix before replanning.',
+    reason: 'Executing all validated read-only observation steps before replanning.',
   };
 }

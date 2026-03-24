@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { CriticReview, FileSnapshotMemory, MemorySummary, TaskPlan, ToolStep } from '../../domain';
+import type { CriticReview, ExecutionProfile, FileSnapshotMemory, MemorySummary, TaskPlan, ToolStep } from '../../domain';
 import { evaluationSchema, supervisorDecisionSchema } from '../../domain';
 import { CancelledError } from '../../errors';
 import type { LlmProvider } from '../../llm';
@@ -45,6 +45,26 @@ function createFallbackSupervisorDecision(input: {
   });
 }
 
+function isAggressiveDeterministicPlan(
+  plan: TaskPlan,
+  context: StepValidationContext,
+): boolean {
+  const snapshotPaths = new Set(context.exactFileSnapshots.map((snapshot) => snapshot.path));
+
+  return plan.steps.every((step) => {
+    if (step.tool === 'repo.apply_patch') {
+      return false;
+    }
+
+    if (step.tool !== 'fs.write_file') {
+      return true;
+    }
+
+    const targetPath = step.input['path'];
+    return typeof targetPath === 'string' && snapshotPaths.has(targetPath);
+  });
+}
+
 export class PlannerAgent {
   constructor(private readonly provider: LlmProvider) {}
 
@@ -54,10 +74,18 @@ export class PlannerAgent {
     tools: ToolDefinition[];
     extraContext: string;
     exactFileSnapshots: FileSnapshotMemory[];
+    executionProfile: ExecutionProfile;
     signal?: AbortSignal;
   }): Promise<TaskPlan> {
     const response = await this.provider.complete({
-      prompt: buildPlanningPrompt(input.goal, input.memory, input.tools, input.extraContext, input.exactFileSnapshots),
+      prompt: buildPlanningPrompt(
+        input.goal,
+        input.memory,
+        input.tools,
+        input.extraContext,
+        input.exactFileSnapshots,
+        input.executionProfile,
+      ),
       schema: taskPlanResponseSchema,
       contract: 'task_plan',
       signal: input.signal,
@@ -73,6 +101,7 @@ export class CriticAgent {
     plan: TaskPlan,
     availableTools: ToolDefinition[],
     context: StepValidationContext,
+    executionProfile: ExecutionProfile,
     signal?: AbortSignal,
   ): Promise<CriticReview> {
     const unknownTool = plan.steps.find((step) => availableTools.every((tool) => tool.name !== step.tool));
@@ -140,8 +169,18 @@ export class CriticAgent {
       );
     }
 
+    if (executionProfile === 'aggressive' && isAggressiveDeterministicPlan(plan, context)) {
+      return decodeCriticReviewResponse(
+        encodeCriticReviewResponse({
+          valid: true,
+          feedback: [],
+          plan,
+        }),
+      );
+    }
+
     const response = await this.provider.complete({
-      prompt: buildCriticPrompt(plan, availableTools, context.exactFileSnapshots),
+      prompt: buildCriticPrompt(plan, availableTools, context.exactFileSnapshots, executionProfile),
       schema: criticReviewResponseSchema,
       contract: 'critic_review',
       signal,

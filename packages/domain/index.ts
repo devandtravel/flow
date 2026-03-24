@@ -6,12 +6,16 @@ export type RuntimeMode = z.infer<typeof runtimeModeSchema>;
 export const autonomyModeSchema = z.enum(['supervised', 'autonomous']);
 export type AutonomyMode = z.infer<typeof autonomyModeSchema>;
 
+export const executionProfileSchema = z.enum(['strict', 'balanced', 'aggressive']);
+export type ExecutionProfile = z.infer<typeof executionProfileSchema>;
+
 export const capabilityNameSchema = z.enum([
   'fs.read',
   'fs.write',
   'git.status',
   'git.branch',
   'git.commit',
+  'repo.search',
   'repo.test',
   'repo.build',
   'repo.check',
