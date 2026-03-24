@@ -24,9 +24,23 @@ function isTemplatePlaceholderString(value: string): boolean {
   return /^<[^>]*\s+[^>]*>$/.test(normalized) || (normalized.startsWith('<') && normalized.endsWith('>'));
 }
 
+function isPlaceholderIdentifierString(value: string): boolean {
+  const normalized = value.trim();
+  if (!/^[A-Z0-9_]+$/.test(normalized)) {
+    return false;
+  }
+
+  return (
+    normalized.includes('PLACEHOLDER') ||
+    normalized.includes('UPDATED_CONTENT') ||
+    normalized.includes('AFTER_ANALYSIS') ||
+    normalized.includes('TODO')
+  );
+}
+
 function containsPlaceholderValue(value: unknown): boolean {
   if (typeof value === 'string') {
-    return isPlaceholderString(value) || isTemplatePlaceholderString(value);
+    return isPlaceholderString(value) || isTemplatePlaceholderString(value) || isPlaceholderIdentifierString(value);
   }
 
   if (Array.isArray(value)) {
@@ -61,6 +75,10 @@ function getWriteFileContentValidationError(step: ToolStep): string | undefined 
 
   if (isTemplatePlaceholderString(content)) {
     return 'content must contain the exact final file body, not a template placeholder.';
+  }
+
+  if (isPlaceholderIdentifierString(content)) {
+    return 'content must contain the exact final file body, not a placeholder token.';
   }
 
   return undefined;

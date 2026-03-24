@@ -97,6 +97,74 @@ describe('LLM providers', () => {
     expect(result.steps[0]?.tool).toBe('fs.list_dir');
   });
 
+  it('codex provider recovers a contract-matching json object prefix from a noisy agent message', async () => {
+    const tempDirectory = mkdtempSync(path.join(os.tmpdir(), 'flow-llm-prefix-'));
+    const executablePath = path.join(tempDirectory, 'mock-codex-prefix.js');
+    writeFileSync(
+      executablePath,
+      [
+        '#!/usr/bin/env node',
+        "const fs = require('node:fs');",
+        "const outputIndex = process.argv.indexOf('--output-last-message');",
+        'if (outputIndex >= 0) {',
+        "  fs.writeFileSync(process.argv[outputIndex + 1], '');",
+        '}',
+        "console.log('{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"{\\\\\"goal\\\\\":\\\\\"demo\\\\\",\\\\\"assumptions\\\\\":[],\\\\\"risks\\\\\":[],\\\\\"steps\\\\\":[{\\\\\"tool\\\\\":\\\\\"fs.list_dir\\\\\",\\\\\"input_json\\\\\":\\\\\"{\\\\\\\\\\\\\"path\\\\\\\\\\\\\":\\\\\\\\\\\\\".\\\\\\\\\\\\\"}\\\\\",\\\\\"expected_json\\\\\":\\\\\"{\\\\\\\\\\\\\"success\\\\\\\\\\\\\":true}\\\\\",\\\\\"rationale\\\\\":\\\\\"observe\\\\\"}],\\\\\"done\\\\\":false,\\\\\"confidence\\\\\":0.5} trailing-noise\"}}');",
+      ].join('\n'),
+      'utf8',
+    );
+    chmodSync(executablePath, 0o755);
+
+    const config = buildDefaultConfig('/tmp/flow-llm', 'project');
+    const provider = new CodexProvider({
+      ...config.llm,
+      executable: executablePath,
+    });
+
+    const result = await provider.complete({
+      prompt: 'Return a task plan.',
+      schema: taskPlanResponseSchema,
+      contract: 'task_plan',
+    });
+
+    expect(result.goal).toBe('demo');
+    expect(result.steps[0]?.tool).toBe('fs.list_dir');
+  });
+
+  it('codex provider normalizes malformed task step json strings before schema parsing', async () => {
+    const tempDirectory = mkdtempSync(path.join(os.tmpdir(), 'flow-llm-step-json-'));
+    const executablePath = path.join(tempDirectory, 'mock-codex-step-json.js');
+    writeFileSync(
+      executablePath,
+      [
+        '#!/usr/bin/env node',
+        "const fs = require('node:fs');",
+        "const outputIndex = process.argv.indexOf('--output-last-message');",
+        'if (outputIndex >= 0) {',
+        "  fs.writeFileSync(process.argv[outputIndex + 1], '');",
+        '}',
+        "console.log('{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"{\\\\\"goal\\\\\":\\\\\"demo\\\\\",\\\\\"assumptions\\\\\":[],\\\\\"risks\\\\\":[],\\\\\"steps\\\\\":[{\\\\\"tool\\\\\":\\\\\"fs.read_file\\\\\",\\\\\"input_json\\\\\":\\\\\"{\\\\\\\\\\\\\"path\\\\\\\\\\\\\":\\\\\\\\\\\\\"README.md\\\\\\\\\\\\\"} trailing-noise\\\\\",\\\\\"expected_json\\\\\":{\\\\\"path\\\\\":\\\\\"README.md\\\\\"},\\\\\"rationale\\\\\":\\\\\"observe\\\\\"}],\\\\\"done\\\\\":false,\\\\\"confidence\\\\\":0.5}\"}}');",
+      ].join('\n'),
+      'utf8',
+    );
+    chmodSync(executablePath, 0o755);
+
+    const config = buildDefaultConfig('/tmp/flow-llm', 'project');
+    const provider = new CodexProvider({
+      ...config.llm,
+      executable: executablePath,
+    });
+
+    const result = await provider.complete({
+      prompt: 'Return a task plan.',
+      schema: taskPlanResponseSchema,
+      contract: 'task_plan',
+    });
+
+    expect(result.steps[0]?.input_json).toBe('{"path":"README.md"}');
+    expect(result.steps[0]?.expected_json).toBe('{"path":"README.md"}');
+  });
+
   it('codex provider aborts an in-flight execution when the signal is cancelled', async () => {
     const tempDirectory = mkdtempSync(path.join(os.tmpdir(), 'flow-llm-abort-'));
     const executablePath = path.join(tempDirectory, 'mock-codex-slow.js');
@@ -187,9 +255,12 @@ describe('LLM providers', () => {
     expect(prompt).toContain('If ExtraContext contains recentFailureClasses');
     expect(prompt).toContain('If ExtraContext contains doNotRepeatRules');
     expect(prompt).toContain('If Memory.semantic contains file_snapshot entries');
+    expect(prompt).toContain('If ExtraContext contains observedPaths or pathObservations');
     expect(prompt).toContain('prefer fs.write_file with the complete final file text');
     expect(prompt).toContain('do not plan reads or patches against guessed child paths');
     expect(prompt).toContain('do not jump directly to guessed descendants');
+    expect(prompt).toContain('reuse confirmed candidate paths from observedPaths/pathObservations');
+    expect(prompt).toContain('if a discovery search returns zero matches');
     expect(prompt).toContain('ExecutionProfile: aggressive');
     expect(prompt).toContain('prioritize fast repository discovery');
     expect(prompt).toContain('repo.symbol_search');
@@ -201,16 +272,18 @@ describe('LLM providers', () => {
       'Шаг 2 использует `fs.read_file` для каталога `apps/web/src/features`, что приведёт к ошибке.',
       'Шаги 3 и 4 оперируют фиктивным путём `apps/web/src/features/<landing-module>/buy-button.tsx`.',
       "ENOENT: no such file or directory, scandir '/tmp/missing'",
+      'Expected repo.search_text to return at least one match.',
     ]);
 
     expect(guidance.failureClasses).toEqual(
-      expect.arrayContaining(['directory_read_mismatch', 'speculative_path', 'nonexistent_path']),
+      expect.arrayContaining(['directory_read_mismatch', 'speculative_path', 'nonexistent_path', 'empty_discovery_result']),
     );
     expect(guidance.doNotRepeatRules).toEqual(
       expect.arrayContaining([
         expect.stringContaining('Не используй fs.read_file для каталогов'),
         expect.stringContaining('Не строй дочерние пути и имена файлов по догадке'),
         expect.stringContaining('Если путь не существует, перепланируйся'),
+        expect.stringContaining('Если discovery-поиск вернул 0 совпадений'),
       ]),
     );
   });

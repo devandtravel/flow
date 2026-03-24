@@ -1,5 +1,13 @@
 import { z } from 'zod';
-import { fileSnapshotMemorySchema, memorySummarySchema, type FileSnapshotMemory, type MemoryEntryRecord, type MemorySummary } from '../domain';
+import {
+  fileSnapshotMemorySchema,
+  memorySummarySchema,
+  pathObservationMemorySchema,
+  type FileSnapshotMemory,
+  type MemoryEntryRecord,
+  type MemorySummary,
+  type PathObservationMemory,
+} from '../domain';
 import type { RuntimeDatabase } from '../db/database';
 
 const memoryObjectSchema = z.record(z.string(), z.unknown());
@@ -11,6 +19,10 @@ function parseMemoryValue(value: string): Record<string, unknown> {
 
 function takeRecent(entries: MemoryEntryRecord[], limit: number): Record<string, unknown>[] {
   return entries.slice(0, limit).map((entry) => parseMemoryValue(entry.value_json));
+}
+
+function toSortedLimitedValues(values: Set<string>, limit: number): string[] {
+  return [...values].sort((left, right) => left.localeCompare(right)).slice(0, limit);
 }
 
 export class MemoryService {
@@ -33,6 +45,46 @@ export class MemoryService {
       .map((value) => fileSnapshotMemorySchema.parse(value))
       .filter((value) => value.task_id === taskId)
       .slice(0, limit);
+  }
+
+  getTaskPathObservations(taskId: string, limit = 20): PathObservationMemory[] {
+    return this.db
+      .listMemory('semantic')
+      .map((entry) => parseMemoryValue(entry.value_json))
+      .filter((value) => pathObservationMemorySchema.safeParse(value).success)
+      .map((value) => pathObservationMemorySchema.parse(value))
+      .filter((value) => value.task_id === taskId)
+      .slice(0, limit);
+  }
+
+  getTaskObservedPaths(taskId: string, limit = 40): string[] {
+    const observedPaths = new Set<string>();
+
+    for (const observation of this.getTaskPathObservations(taskId, limit)) {
+      for (const observedPath of observation.observed_paths) {
+        observedPaths.add(observedPath);
+      }
+    }
+
+    return toSortedLimitedValues(observedPaths, limit);
+  }
+
+  getTargetObservedPaths(targetId: string, limit = 40): string[] {
+    const observedPaths = new Set<string>();
+
+    for (const observation of this.db
+      .listMemory('semantic')
+      .map((entry) => parseMemoryValue(entry.value_json))
+      .filter((value) => pathObservationMemorySchema.safeParse(value).success)
+      .map((value) => pathObservationMemorySchema.parse(value))
+      .filter((value) => value.target_id === targetId)
+      .slice(0, limit)) {
+      for (const observedPath of observation.observed_paths) {
+        observedPaths.add(observedPath);
+      }
+    }
+
+    return toSortedLimitedValues(observedPaths, limit);
   }
 
   recordRun(runId: string, summary: Record<string, unknown>): void {

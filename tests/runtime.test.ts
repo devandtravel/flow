@@ -64,6 +64,129 @@ class AbortAwareDelayedProvider implements LlmProvider {
   }
 }
 
+class ObservationAwareProvider implements LlmProvider {
+  private taskPlanCalls = 0;
+  private criticCalls = 0;
+
+  async complete<TOutput>(request: LlmRequest<TOutput>): Promise<TOutput> {
+    if (request.contract === 'task_plan') {
+      this.taskPlanCalls += 1;
+      if (this.taskPlanCalls === 1) {
+        return request.schema.parse({
+          goal: 'rewrite readme after salvage',
+          assumptions: [],
+          risks: [],
+          steps: [
+            {
+              tool: 'fs.read_file',
+              input_json: '{"path":"README.md"}',
+              expected_json: '{"content_includes":"missing marker"}',
+              rationale: 'Read the file before editing it.',
+            },
+            {
+              tool: 'repo.apply_patch',
+              input_json: '{"patch":"*** Update File: README.md\\n@@\\n <точный контекст будет основан на шаге 1>\\n+# Changed\\n"}',
+              expected_json: '{"changed":true}',
+              rationale: 'Apply a speculative patch.',
+            },
+          ],
+          done: false,
+          confidence: 0.3,
+        });
+      }
+
+      expect(request.prompt).toContain('ExactFileSnapshots:');
+      expect(request.prompt).toContain('README.md');
+      expect(request.prompt).toContain('# Initial');
+
+      return request.schema.parse({
+        goal: 'rewrite readme after salvage',
+        assumptions: [],
+        risks: [],
+        steps: [
+          {
+            tool: 'fs.write_file',
+            input_json: '{"path":"README.md","content":"# Initial\\n\\n## FLOW validation\\n\\nObservation-driven replanning.\\n"}',
+            expected_json: '{"changed":true}',
+            rationale: 'Rewrite the file using the exact observed content.',
+          },
+          {
+            tool: 'fs.read_file',
+            input_json: '{"path":"README.md"}',
+            expected_json: '{"content_includes":"FLOW validation"}',
+            rationale: 'Verify the inserted section.',
+          },
+        ],
+        done: false,
+        confidence: 0.82,
+      });
+    }
+
+    if (request.contract === 'critic_review') {
+      this.criticCalls += 1;
+      if (this.criticCalls === 1) {
+        return request.schema.parse({
+          valid: false,
+          feedback: ['Use the exact observed README.md content instead of a speculative patch.'],
+          plan: {
+            goal: 'rewrite readme after salvage',
+            assumptions: [],
+            risks: [],
+            steps: [
+              {
+                tool: 'fs.read_file',
+                input_json: '{"path":"README.md"}',
+                expected_json: '{"content_includes":"missing marker"}',
+                rationale: 'Read the file before editing it.',
+              },
+              {
+                tool: 'repo.apply_patch',
+                input_json: '{"patch":"*** Update File: README.md\\n@@\\n <точный контекст будет основан на шаге 1>\\n+# Changed\\n"}',
+                expected_json: '{"changed":true}',
+                rationale: 'Apply a speculative patch.',
+              },
+            ],
+            done: false,
+            confidence: 0.3,
+          },
+        });
+      }
+
+      return request.schema.parse({
+        valid: true,
+        feedback: [],
+        plan: {
+          goal: 'rewrite readme after salvage',
+          assumptions: [],
+          risks: [],
+          steps: [
+            {
+              tool: 'fs.write_file',
+              input_json: '{"path":"README.md","content":"# Initial\\n\\n## FLOW validation\\n\\nObservation-driven replanning.\\n"}',
+              expected_json: '{"changed":true}',
+              rationale: 'Rewrite the file using the exact observed content.',
+            },
+            {
+              tool: 'fs.read_file',
+              input_json: '{"path":"README.md"}',
+              expected_json: '{"content_includes":"FLOW validation"}',
+              rationale: 'Verify the inserted section.',
+            },
+          ],
+          done: false,
+          confidence: 0.82,
+        },
+      });
+    }
+
+    return request.schema.parse({
+      score: 1,
+      issues: [],
+      suggestions: [],
+    });
+  }
+}
+
 describe('AgentRuntime', () => {
   it('executes a project task with the mock provider and stores typed artifacts', async () => {
     const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-project-'));
@@ -257,10 +380,6 @@ describe('AgentRuntime', () => {
         confidence: 0.4,
       },
       {
-        decision: 'replan',
-        reason: 'Use observed file content to produce a full rewrite.',
-      },
-      {
         goal: 'rewrite readme',
         assumptions: [],
         risks: [],
@@ -319,9 +438,35 @@ describe('AgentRuntime', () => {
     const timeline = runtime.getTaskTimeline(task.id);
 
     expect(summary.state).toBe('completed');
+    expect(timeline.runs.some((run) => run.events.some((event) => event.message === 'auto_replan_after_salvage'))).toBe(true);
     expect(timeline.runs.some((run) => run.events.some((event) => event.message === 'observation_salvage_completed'))).toBe(true);
     expect(timeline.runs.some((run) => run.events.some((event) => event.message === 'plan_invalid'))).toBe(true);
     expect(readFileSync(path.join(workspaceRoot, 'README.md'), 'utf8')).toContain('FLOW validation');
+  });
+
+  it('records successful observation memory even when salvage verification fails and auto-replans without supervisor', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-observation-replan-'));
+    writeFileSync(path.join(workspaceRoot, 'README.md'), '# Initial\n', 'utf8');
+
+    const config = buildDefaultConfig(workspaceRoot, 'project');
+    config.autonomy.mode = 'autonomous';
+    config.execution.profile = 'aggressive';
+    const runtime = new AgentRuntime({
+      workspaceRoot,
+      config,
+      provider: new ObservationAwareProvider(),
+    });
+
+    const task = runtime.createTask('rewrite readme after salvage');
+    const summary = await runtime.runTask(task.id);
+    const timeline = runtime.getTaskTimeline(task.id);
+    const eventMessages = timeline.runs.flatMap((run) => run.events.map((event) => event.message));
+
+    expect(summary.state).toBe('completed');
+    expect(eventMessages).toContain('auto_replan_after_salvage');
+    expect(eventMessages).not.toContain('supervisor_decision');
+    expect(runtime.memory.getTaskFileSnapshots(task.id).map((snapshot) => snapshot.path)).toContain('README.md');
+    expect(readFileSync(path.join(workspaceRoot, 'README.md'), 'utf8')).toContain('Observation-driven replanning.');
   });
 
   it('does not spend execution runtime budget on planning time', async () => {

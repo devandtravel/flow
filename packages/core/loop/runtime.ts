@@ -313,6 +313,18 @@ function getStringValue(payloadJson: string, key: string): string | undefined {
   return envelope[key];
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function getRecordArray(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter((entry) => isRecord(entry));
+}
+
 function getStringDetail(details: Record<string, unknown>, key: string): string | undefined {
   const value = details[key];
   return typeof value === 'string' ? value : undefined;
@@ -982,16 +994,22 @@ export class AgentRuntime {
     };
   }
 
-  private recordVerifiedStepMemory(
+  private recordObservationMemory(
     task: TaskRecord,
     run: RunRecord,
     stepRecord: StepRecord,
     step: TaskPlan['steps'][number],
     result: z.infer<typeof toolResultSchema>,
-  ): void {
+  ): { snapshotPaths: string[]; observedPaths: string[] } {
     if (!result.success) {
-      return;
+      return {
+        snapshotPaths: [],
+        observedPaths: [],
+      };
     }
+
+    const snapshotPaths: string[] = [];
+    const collectedObservedPaths: string[] = [];
 
     if (step.tool === 'fs.read_file') {
       const filePath = step.input['path'];
@@ -1007,13 +1025,107 @@ export class AgentRuntime {
           step_id: stepRecord.id,
           recorded_at: new Date().toISOString(),
         });
+        snapshotPaths.push(filePath);
       }
     }
 
-    this.memory.recordSuccessfulPattern(step.tool, {
-      input: step.input,
+    if (step.tool === 'repo.search_text' || step.tool === 'repo.symbol_search') {
+      const matches = getRecordArray(result.output['matches']);
+      const matchedPaths = matches
+        .map((match) => match['path'])
+        .filter((value): value is string => typeof value === 'string')
+        .map((matchPath) => this.normalizeObservedPath(matchPath))
+        .filter((value): value is string => value !== undefined);
+      const queryValue = step.tool === 'repo.symbol_search' ? step.input['symbol'] : step.input['query'];
+      if (matchedPaths.length > 0) {
+        this.recordPathObservation(task, run, stepRecord, step.tool, '.', matchedPaths, queryValue);
+        for (const observedPath of matchedPaths) {
+          collectedObservedPaths.push(observedPath);
+        }
+      }
+    }
+
+    if (step.tool === 'repo.search_files') {
+      const files = result.output['files'];
+      const matchedPaths = Array.isArray(files)
+        ? files
+            .filter((value): value is string => typeof value === 'string')
+            .map((filePath) => this.normalizeObservedPath(filePath))
+            .filter((value): value is string => value !== undefined)
+        : [];
+      const pattern = step.input['pattern'];
+      if (matchedPaths.length > 0) {
+        this.recordPathObservation(
+          task,
+          run,
+          stepRecord,
+          step.tool,
+          typeof step.input['path'] === 'string' ? step.input['path'] : '.',
+          matchedPaths,
+          typeof pattern === 'string' ? pattern : undefined,
+        );
+        for (const observedPath of matchedPaths) {
+          collectedObservedPaths.push(observedPath);
+        }
+      }
+    }
+
+    if (step.tool === 'fs.list_dir') {
+      const directoryPathValue = result.output['path'];
+      const entries = getRecordArray(result.output['entries']);
+      if (typeof directoryPathValue === 'string') {
+        const normalizedDirectoryPath = this.normalizeObservedPath(directoryPathValue);
+        if (normalizedDirectoryPath !== undefined) {
+          const listedPaths = entries
+            .map((entry) => entry['name'])
+            .filter((value): value is string => typeof value === 'string')
+            .map((entryName) => path.join(normalizedDirectoryPath, entryName));
+          if (listedPaths.length > 0) {
+            this.recordPathObservation(task, run, stepRecord, step.tool, normalizedDirectoryPath, listedPaths);
+            for (const observedPath of listedPaths) {
+              collectedObservedPaths.push(observedPath);
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      snapshotPaths,
+      observedPaths: collectedObservedPaths,
+    };
+  }
+
+  private normalizeObservedPath(observedPath: string): string | undefined {
+    const absolutePath = path.isAbsolute(observedPath) ? observedPath : path.resolve(this.workspaceRoot, observedPath);
+    const relativePath = path.relative(this.workspaceRoot, absolutePath);
+    if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+      return undefined;
+    }
+
+    return relativePath.length === 0 ? '.' : relativePath;
+  }
+
+  private recordPathObservation(
+    task: TaskRecord,
+    run: RunRecord,
+    stepRecord: StepRecord,
+    sourceTool: 'repo.search_text' | 'repo.search_files' | 'repo.symbol_search' | 'fs.list_dir',
+    anchorPath: string,
+    observedPaths: string[],
+    query?: string,
+  ): void {
+    this.memory.recordSemantic(`observed-paths:${task.id}:${run.id}:${stepRecord.id}`, {
+      type: 'path_observation',
+      task_id: task.id,
       target_id: task.target_id,
-      timestamp: new Date().toISOString(),
+      source_tool: sourceTool,
+      anchor_path: anchorPath,
+      query,
+      observed_paths: observedPaths,
+      run_id: run.id,
+      step_id: stepRecord.id,
+      recorded_at: new Date().toISOString(),
     });
   }
 
@@ -1023,11 +1135,12 @@ export class AgentRuntime {
     target: TargetConfig,
     steps: readonly TaskPlan['steps'][number][],
     createdArtifacts: ArtifactRecord[],
-  ): Promise<{ executedSteps: number; snapshotPaths: string[] }> {
+  ): Promise<{ executedSteps: number; snapshotPaths: string[]; observedPaths: string[] }> {
     if (steps.length === 0) {
       return {
         executedSteps: 0,
         snapshotPaths: [],
+        observedPaths: [],
       };
     }
 
@@ -1042,6 +1155,7 @@ export class AgentRuntime {
       httpAllowlist: this.config.http.allowlist,
     };
     const snapshotPaths = new Set<string>();
+    const observedPaths = new Set<string>();
     let executedSteps = 0;
 
     for (const [index, step] of steps.entries()) {
@@ -1075,28 +1189,36 @@ export class AgentRuntime {
         source: 'observation_salvage',
       });
 
+      const observationMemory = this.recordObservationMemory(task, run, completedStep, step, result);
+      for (const snapshotPath of observationMemory.snapshotPaths) {
+        snapshotPaths.add(snapshotPath);
+      }
+      for (const observedPath of observationMemory.observedPaths) {
+        observedPaths.add(observedPath);
+      }
+
       if (!verification.verified) {
         break;
       }
 
       executedSteps += 1;
-      this.recordVerifiedStepMemory(task, run, completedStep, step, result);
-      if (step.tool === 'fs.read_file') {
-        const filePath = step.input['path'];
-        if (typeof filePath === 'string') {
-          snapshotPaths.add(filePath);
-        }
-      }
+      this.memory.recordSuccessfulPattern(step.tool, {
+        input: step.input,
+        target_id: task.target_id,
+        timestamp: new Date().toISOString(),
+      });
     }
 
     this.createRunEvent(task.id, run.id, 'info', 'observation_salvage_completed', {
       executedSteps,
       snapshotPaths: [...snapshotPaths],
+      observedPaths: [...observedPaths],
     });
 
     return {
       executedSteps,
       snapshotPaths: [...snapshotPaths],
+      observedPaths: [...observedPaths],
     };
   }
 
@@ -1104,6 +1226,18 @@ export class AgentRuntime {
     const toolCatalog = listToolDefinitions(this.tools).filter((tool) => target.capabilities.includes(tool.capability));
     const memory = this.memory.getContext();
     const exactFileSnapshots = this.memory.getTaskFileSnapshots(task.id);
+    const observedPaths = Array.from(
+      new Set([
+        ...this.memory.getTargetObservedPaths(task.target_id),
+        ...this.memory.getTaskObservedPaths(task.id),
+      ]),
+    );
+    const pathObservations = this.memory.getTaskPathObservations(task.id).map((observation) => ({
+      sourceTool: observation.source_tool,
+      anchorPath: observation.anchor_path,
+      query: observation.query,
+      observedPaths: observation.observed_paths,
+    }));
     const recentFailureHints = this.getRecentTaskFailureHints(task.id);
     const replanGuidance = buildReplanGuidance(recentFailureHints);
     return this.planner.generate({
@@ -1121,6 +1255,8 @@ export class AgentRuntime {
         executionProfile: this.config.execution.profile,
         targetCapabilities: target.capabilities,
         exactFileSnapshotPaths: exactFileSnapshots.map((snapshot) => snapshot.path),
+        observedPaths,
+        pathObservations,
         recentFailureHints,
         recentFailureClasses: replanGuidance.failureClasses,
         doNotRepeatRules: replanGuidance.doNotRepeatRules,
@@ -1980,7 +2116,7 @@ export class AgentRuntime {
             const salvagePlan = buildObservationSalvagePlan(lastPlan, availableTools);
             const salvageResult =
               salvagePlan === undefined
-                ? { executedSteps: 0, snapshotPaths: [] as string[] }
+                ? { executedSteps: 0, snapshotPaths: [] as string[], observedPaths: [] as string[] }
                 : await this.executeObservationSalvage(task, run, target, salvagePlan.steps, createdArtifacts);
             this.createRunEvent(task.id, run.id, 'error', 'plan_invalid', {
               feedback: review.feedback,
@@ -1988,9 +2124,24 @@ export class AgentRuntime {
               doNotRepeatRules: replanGuidance.doNotRepeatRules,
               observationSalvageSteps: salvageResult.executedSteps,
               observationSnapshotPaths: salvageResult.snapshotPaths,
+              observationObservedPaths: salvageResult.observedPaths,
             });
             this.finishRun(run, 'failed');
             task = this.transitionTask(task, 'failed');
+            const shouldAutoReplan =
+              iteration < this.config.limits.max_iterations &&
+              (salvageResult.snapshotPaths.length > 0 || salvageResult.observedPaths.length > 0);
+
+            if (shouldAutoReplan) {
+              this.metrics.recordRetry();
+              this.createRunEvent(task.id, run.id, 'warning', 'auto_replan_after_salvage', {
+                snapshotPaths: salvageResult.snapshotPaths,
+                observedPaths: salvageResult.observedPaths,
+              });
+              task = this.transitionTask(task, 'retryable');
+              continue;
+            }
+
             const decision = await this.runWithTaskAbortController(task.id, (signal) =>
               this.supervisor.decide({
                 hadFailure: true,
@@ -2255,13 +2406,19 @@ export class AgentRuntime {
           changedFiles: result.changedFiles,
         });
 
+        const observationMemory = this.recordObservationMemory(task, run, completedStep, step, result);
+
         for (const changedFile of result.changedFiles) {
           this.getChangedFilesSet(run.id).add(changedFile);
         }
 
         if (verification.verified) {
           verifiedSteps += 1;
-          this.recordVerifiedStepMemory(task, run, completedStep, step, result);
+          this.memory.recordSuccessfulPattern(step.tool, {
+            input: step.input,
+            target_id: task.target_id,
+            timestamp: new Date().toISOString(),
+          });
           const stopAfterStep = this.applyStopRequestIfNeeded(task, this.database.getRun(run.id) ?? run, `Остановка выполнена после шага ${String(index + 1)}.`);
           if (stopAfterStep) {
             return {
@@ -2277,6 +2434,13 @@ export class AgentRuntime {
         } else {
           hadFailure = true;
           failures.push(verification.evidence);
+          if (observationMemory.snapshotPaths.length > 0 || observationMemory.observedPaths.length > 0) {
+            this.createRunEvent(task.id, run.id, 'warning', 'partial_observation_recorded', {
+              step: step.tool,
+              snapshotPaths: observationMemory.snapshotPaths,
+              observedPaths: observationMemory.observedPaths,
+            });
+          }
           this.memory.recordFailure(`step:${completedStep.id}`, {
             tool: step.tool,
             error: verification.evidence,

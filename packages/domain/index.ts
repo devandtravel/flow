@@ -285,3 +285,17 @@ export const fileSnapshotMemorySchema = z.object({
   recorded_at: z.string().datetime(),
 });
 export type FileSnapshotMemory = z.infer<typeof fileSnapshotMemorySchema>;
+
+export const pathObservationMemorySchema = z.object({
+  type: z.literal('path_observation'),
+  task_id: z.string().uuid(),
+  target_id: z.string().min(1),
+  source_tool: z.enum(['repo.search_text', 'repo.search_files', 'repo.symbol_search', 'fs.list_dir']),
+  anchor_path: z.string().min(1),
+  query: z.string().optional(),
+  observed_paths: z.array(z.string().min(1)).min(1),
+  run_id: z.string().uuid(),
+  step_id: z.string().uuid(),
+  recorded_at: z.string().datetime(),
+});
+export type PathObservationMemory = z.infer<typeof pathObservationMemorySchema>;

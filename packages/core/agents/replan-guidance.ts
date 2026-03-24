@@ -5,6 +5,7 @@ export const replanFailureClassSchema = z.enum([
   'full_file_text_required',
   'invalid_patch_format',
   'snapshot_backed_write_required',
+  'empty_discovery_result',
   'directory_read_mismatch',
   'speculative_path',
   'nonexistent_path',
@@ -41,6 +42,11 @@ const ruleDefinitions: ReplanRuleDefinition[] = [
     pattern: /file_snapshot memory|instead of repo\.apply_patch/i,
     failureClass: 'snapshot_backed_write_required',
     rule: 'Если exact file snapshot уже есть, не используй repo.apply_patch для этого файла; используй fs.write_file с полным итоговым текстом.',
+  },
+  {
+    pattern: /Expected repo\.search_(text|files)|Expected repo\.symbol_search|return at least one match|return at least one file path/i,
+    failureClass: 'empty_discovery_result',
+    rule: 'Если discovery-поиск вернул 0 совпадений, не продолжай план от пустого результата; сузь запрос до конкретных идентификаторов полей из цели или переключись между repo.search_text, repo.search_files и repo.symbol_search.',
   },
   {
     pattern: /fs\.read_file.*directory|EISDIR: illegal operation on a directory, read|использует `fs\.read_file` для каталога/i,

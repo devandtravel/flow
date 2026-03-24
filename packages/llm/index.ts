@@ -194,6 +194,116 @@ function getStructuredOutputCandidates(
   return candidates;
 }
 
+function extractJsonObjectPrefix(text: string): string | undefined {
+  const trimmed = text.trim();
+  const startIndex = trimmed.indexOf('{');
+  if (startIndex < 0) {
+    return undefined;
+  }
+
+  return findJsonObjectAt(trimmed, startIndex);
+}
+
+function parseStructuredCandidate(
+  contract: LlmContract,
+  raw: string,
+): Record<string, unknown> | undefined {
+  const directCandidate = raw.trim();
+  const candidates = new Set<string>();
+  if (directCandidate.length > 0) {
+    candidates.add(directCandidate);
+  }
+
+  const prefixedCandidate = extractJsonObjectPrefix(raw);
+  if (prefixedCandidate && prefixedCandidate.length > 0) {
+    candidates.add(prefixedCandidate);
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (matchesContractSignature(contract, parsed)) {
+        return parsed;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeJsonObjectString(value: unknown): string | undefined {
+  if (isRecord(value)) {
+    return JSON.stringify(value);
+  }
+
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  try {
+    const parsedValue = JSON.parse(value);
+    if (isRecord(parsedValue)) {
+      return JSON.stringify(parsedValue);
+    }
+  } catch {
+    const objectPrefix = extractJsonObjectPrefix(value);
+    if (!objectPrefix) {
+      return undefined;
+    }
+
+    try {
+      const parsedPrefix = JSON.parse(objectPrefix);
+      if (isRecord(parsedPrefix)) {
+        return JSON.stringify(parsedPrefix);
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeTaskPlanPayload(value: Record<string, unknown>): Record<string, unknown> {
+  const stepsValue = value['steps'];
+  if (!Array.isArray(stepsValue)) {
+    return value;
+  }
+
+  const normalizedSteps = stepsValue.map((stepValue) => {
+    if (!isRecord(stepValue)) {
+      return stepValue;
+    }
+
+    const normalizedInput = normalizeJsonObjectString(stepValue['input_json']);
+    const normalizedExpected = normalizeJsonObjectString(stepValue['expected_json']);
+
+    return {
+      ...stepValue,
+      input_json: normalizedInput ?? stepValue['input_json'],
+      expected_json: normalizedExpected ?? stepValue['expected_json'],
+    };
+  });
+
+  return {
+    ...value,
+    steps: normalizedSteps,
+  };
+}
+
+function normalizeStructuredCandidate(
+  contract: LlmContract,
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  if (contract === 'task_plan') {
+    return normalizeTaskPlanPayload(value);
+  }
+
+  return value;
+}
+
 function matchesContractSignature(contract: LlmContract, value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) {
     return false;
@@ -514,12 +624,13 @@ export class CodexProvider implements LlmProvider {
       }
 
       for (const raw of rawCandidates) {
+        const parsed = parseStructuredCandidate(request.contract, raw);
+        if (parsed) {
+          return request.schema.parse(normalizeStructuredCandidate(request.contract, parsed));
+        }
+
         try {
-          const parsed = JSON.parse(raw);
-          if (!matchesContractSignature(request.contract, parsed)) {
-            continue;
-          }
-          return request.schema.parse(parsed);
+          JSON.parse(raw);
         } catch (error) {
           lastError = new InvalidOperationError(
             error instanceof Error ? error.message : 'Codex returned invalid structured output.',

@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { z } from 'zod';
 import type { CriticReview, ExecutionProfile, FileSnapshotMemory, MemorySummary, TaskPlan, ToolStep } from '../../domain';
 import { evaluationSchema, supervisorDecisionSchema } from '../../domain';
@@ -63,6 +64,102 @@ function isAggressiveDeterministicPlan(
     const targetPath = step.input['path'];
     return typeof targetPath === 'string' && snapshotPaths.has(targetPath);
   });
+}
+
+function hasExpectedBoolean(step: ToolStep, key: string): boolean | undefined {
+  const value = step.expected[key];
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function hasExpectedString(step: ToolStep, key: string): string | undefined {
+  const value = step.expected[key];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function matchesExpectedPath(actualPath: string, expectedPath: string): boolean {
+  const normalizedActualPath = path.normalize(actualPath);
+  const normalizedExpectedPath = path.normalize(expectedPath);
+  return (
+    normalizedActualPath === normalizedExpectedPath ||
+    normalizedActualPath.endsWith(`${path.sep}${normalizedExpectedPath}`)
+  );
+}
+
+function getRecordArray(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter((entry): entry is Record<string, unknown> => typeof entry === 'object' && entry !== null);
+}
+
+function verifyDiscoveryExpectation(step: ToolStep, result: ToolResult): string | undefined {
+  if (step.tool === 'fs.read_file') {
+    const expectedPath = hasExpectedString(step, 'path');
+    if (expectedPath !== undefined) {
+      const actualPath = result.output['path'];
+      if (typeof actualPath !== 'string' || !matchesExpectedPath(actualPath, expectedPath)) {
+        return `Expected fs.read_file to read ${expectedPath}.`;
+      }
+    }
+
+    const expectedContent = hasExpectedString(step, 'content_includes');
+    if (expectedContent !== undefined) {
+      const actualContent = result.output['content'];
+      if (typeof actualContent !== 'string' || !actualContent.includes(expectedContent)) {
+        return `Expected fs.read_file content to include "${expectedContent}".`;
+      }
+    }
+  }
+
+  if (step.tool === 'fs.list_dir') {
+    const expectedEntry = hasExpectedString(step, 'entries_include');
+    if (expectedEntry !== undefined) {
+      const entries = getRecordArray(result.output['entries']);
+      const hasEntry = entries.some((entry) => entry['name'] === expectedEntry);
+      if (!hasEntry) {
+        return `Expected fs.list_dir entries to include "${expectedEntry}".`;
+      }
+    }
+  }
+
+  if (step.tool === 'repo.search_text' || step.tool === 'repo.symbol_search') {
+    const expectedMatchesFound = hasExpectedBoolean(step, 'matches_found');
+    const matchCount = result.output['match_count'];
+    if (expectedMatchesFound === true && (typeof matchCount !== 'number' || matchCount <= 0)) {
+      return `Expected ${step.tool} to return at least one match.`;
+    }
+
+    const expectedFirstPath = hasExpectedString(step, 'first_path');
+    if (expectedFirstPath !== undefined) {
+      const matches = getRecordArray(result.output['matches']);
+      const firstPath = matches[0]?.['path'];
+      if (typeof firstPath !== 'string' || !matchesExpectedPath(firstPath, expectedFirstPath)) {
+        return `Expected ${step.tool} first path to match ${expectedFirstPath}.`;
+      }
+    }
+  }
+
+  if (step.tool === 'repo.search_files') {
+    const expectedFilesFound = hasExpectedBoolean(step, 'matches_found');
+    const fileCount = result.output['file_count'];
+    if (expectedFilesFound === true && (typeof fileCount !== 'number' || fileCount <= 0)) {
+      return 'Expected repo.search_files to return at least one file path.';
+    }
+  }
+
+  if (step.tool === 'git.status') {
+    const expectedHasModified = hasExpectedBoolean(step, 'has_modified');
+    if (expectedHasModified !== undefined) {
+      const stdout = result.output['stdout'];
+      const hasModified = typeof stdout === 'string' && stdout.trim().length > 0;
+      if (expectedHasModified !== hasModified) {
+        return `Expected git.status has_modified to be ${String(expectedHasModified)}.`;
+      }
+    }
+  }
+
+  return undefined;
 }
 
 export class PlannerAgent {
@@ -204,6 +301,22 @@ export class VerifierAgent {
       return {
         verified: false,
         evidence: result.error,
+      };
+    }
+
+    const semanticValidationError = getStepSemanticValidationError(step);
+    if (semanticValidationError !== undefined) {
+      return {
+        verified: false,
+        evidence: `Invalid semantic content for tool ${step.tool}: ${semanticValidationError}`,
+      };
+    }
+
+    const discoveryExpectationError = verifyDiscoveryExpectation(step, result);
+    if (discoveryExpectationError !== undefined) {
+      return {
+        verified: false,
+        evidence: discoveryExpectationError,
       };
     }
 
