@@ -2,6 +2,7 @@ export type DomainErrorCode =
   | 'not_found'
   | 'conflict'
   | 'invalid_operation'
+  | 'cancelled'
   | 'validation'
   | 'approval_required';
 
@@ -31,6 +32,12 @@ export class ConflictError extends DomainError {
 export class InvalidOperationError extends DomainError {
   constructor(message: string, details: Record<string, unknown> = {}) {
     super('invalid_operation', message, details);
+  }
+}
+
+export class CancelledError extends DomainError {
+  constructor(message: string, details: Record<string, unknown> = {}) {
+    super('cancelled', message, details);
   }
 }
 

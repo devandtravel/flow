@@ -4,6 +4,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildDefaultConfig } from '../packages/config';
 import { AgentRuntime } from '../packages/core/loop/runtime';
+import { CancelledError } from '../packages/errors';
 import { MockLlmProvider, type LlmProvider, type LlmRequest } from '../packages/llm';
 
 class SequencedProvider implements LlmProvider {
@@ -27,6 +28,35 @@ class DelayedMockProvider implements LlmProvider {
   async complete<TOutput>(request: LlmRequest<TOutput>): Promise<TOutput> {
     await new Promise((resolve) => {
       setTimeout(resolve, this.delayMs);
+    });
+
+    const mockProvider = new MockLlmProvider();
+    return mockProvider.complete(request);
+  }
+}
+
+class AbortAwareDelayedProvider implements LlmProvider {
+  constructor(private readonly delayMs: number) {}
+
+  async complete<TOutput>(request: LlmRequest<TOutput>): Promise<TOutput> {
+    await new Promise<void>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        request.signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, this.delayMs);
+
+      const onAbort = (): void => {
+        clearTimeout(timeoutId);
+        request.signal?.removeEventListener('abort', onAbort);
+        reject(new CancelledError('LLM execution was cancelled.'));
+      };
+
+      if (request.signal?.aborted) {
+        onAbort();
+        return;
+      }
+
+      request.signal?.addEventListener('abort', onAbort, { once: true });
     });
 
     const mockProvider = new MockLlmProvider();
@@ -136,6 +166,52 @@ describe('AgentRuntime', () => {
 
     const summary = await runPromise;
     expect(summary.state).toBe('cancelled');
+  });
+
+  it('interrupts planning when stop is requested for an active task', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-stop-planning-abort-'));
+    const config = buildDefaultConfig(workspaceRoot, 'project');
+    config.autonomy.mode = 'autonomous';
+    const runtime = new AgentRuntime({
+      workspaceRoot,
+      config,
+      provider: new AbortAwareDelayedProvider(5_000),
+    });
+
+    const task = runtime.createTask('interrupt long planning');
+    const startedAt = Date.now();
+    const runPromise = runtime.runTask(task.id);
+
+    await new Promise<void>((resolve) => {
+      setTimeout(() => resolve(), 50);
+    });
+
+    runtime.stopTask(task.id);
+    const summary = await runPromise;
+    const durationMs = Date.now() - startedAt;
+
+    expect(summary.state).toBe('cancelled');
+    expect(durationMs).toBeLessThan(2_000);
+  });
+
+  it('cancels an orphaned in-flight task immediately on stop request', () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'flow-runtime-stop-orphan-'));
+    const config = buildDefaultConfig(workspaceRoot, 'project');
+    config.llm.provider = 'mock';
+    const runtime = new AgentRuntime({ workspaceRoot, config });
+    const task = runtime.createTask('orphan planning task');
+    const updatedTask = runtime.database.updateTaskState(task.id, 'planning');
+    const run = runtime.database.createRun(task.id, 1, 'planning');
+    runtime.database.updateRunState(run.id, 'planning');
+
+    const stoppedTask = runtime.stopTask(task.id);
+    const timeline = runtime.getTaskTimeline(task.id);
+
+    expect(updatedTask.state).toBe('planning');
+    expect(stoppedTask.state).toBe('cancelled');
+    expect(timeline.runs[0]?.events.map((event) => event.message)).toEqual(
+      expect.arrayContaining(['task_stop_requested', 'task_stopped']),
+    );
   });
 
   it('stop-and-delete all tasks, including queued tasks, through the bulk deletion path', async () => {

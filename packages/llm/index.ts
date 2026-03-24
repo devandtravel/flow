@@ -1,11 +1,11 @@
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { z } from 'zod';
 import type { RuntimeConfig } from '../config';
 import type { TaskPlan, ToolStep } from '../domain';
-import { InvalidOperationError } from '../errors';
+import { CancelledError, InvalidOperationError } from '../errors';
 import {
   createJsonSchema,
   encodeTaskPlanResponse,
@@ -18,10 +18,18 @@ export interface LlmRequest<TOutput> {
   prompt: string;
   schema: z.ZodType<TOutput>;
   contract: LlmContract;
+  signal?: AbortSignal;
 }
 
 export interface LlmProvider {
   complete<TOutput>(request: LlmRequest<TOutput>): Promise<TOutput>;
+}
+
+interface ProcessExecutionResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -215,6 +223,82 @@ function buildStructuredOutputRetryPrompt(basePrompt: string): string {
   ].join('\n');
 }
 
+function executeProcess(
+  executable: string,
+  args: string[],
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<ProcessExecutionResult> {
+  if (signal?.aborted) {
+    return Promise.reject(new CancelledError('LLM execution was cancelled before startup.'));
+  }
+
+  return new Promise<ProcessExecutionResult>((resolve, reject) => {
+    const child = spawn(executable, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let finished = false;
+    let timedOut = false;
+    let abortRequested = false;
+    const timeoutId: ReturnType<typeof setTimeout> = setTimeout(() => {
+      timedOut = true;
+      if (!finished) {
+        child.kill('SIGTERM');
+      }
+    }, timeoutMs);
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+
+    const cleanup = (): void => {
+      clearTimeout(timeoutId);
+      signal?.removeEventListener('abort', onAbort);
+      child.removeAllListeners('error');
+      child.removeAllListeners('close');
+    };
+
+    const onAbort = (): void => {
+      abortRequested = true;
+      if (!finished) {
+        child.kill('SIGTERM');
+      }
+    };
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    child.once('error', (error) => {
+      finished = true;
+      cleanup();
+      reject(error);
+    });
+
+    child.once('close', (code) => {
+      finished = true;
+      cleanup();
+      if (abortRequested || signal?.aborted) {
+        reject(new CancelledError('LLM execution was cancelled.'));
+        return;
+      }
+      resolve({
+        status: code,
+        stdout,
+        stderr,
+        timedOut,
+      });
+    });
+  });
+}
+
 function createHeuristicPlan(goal: string): TaskPlan {
   const normalizedGoal = goal.toLowerCase();
   const steps: ToolStep[] = [];
@@ -293,6 +377,10 @@ function createHeuristicPlan(goal: string): TaskPlan {
 
 export class MockLlmProvider implements LlmProvider {
   async complete<TOutput>(request: LlmRequest<TOutput>): Promise<TOutput> {
+    if (request.signal?.aborted) {
+      throw new CancelledError('LLM execution was cancelled.');
+    }
+
     if (request.prompt.includes('You are FLOW critic.')) {
       const planMatch = request.prompt.match(/Plan:\s*(.+)\nAvailableTools:/s);
       const parsedPlan = planMatch ? JSON.parse(planMatch[1]) : createHeuristicPlan('unknown goal');
@@ -366,10 +454,29 @@ export class CodexProvider implements LlmProvider {
         prompt,
       ];
 
-      const execution = spawnSync(this.config.executable, args, {
-        encoding: 'utf8',
-        timeout: this.config.timeout_ms,
-      });
+      const execution = await executeProcess(
+        this.config.executable,
+        args,
+        this.config.timeout_ms,
+        request.signal,
+      );
+
+      if (execution.timedOut) {
+        lastError = new InvalidOperationError('Codex execution timed out.', {
+          executable: this.config.executable,
+          model: this.config.model,
+          status: execution.status,
+          stdout: execution.stdout,
+          stderr: execution.stderr,
+          responseExists: existsSync(outputPath),
+          attempt,
+          maxAttempts,
+        });
+        if (attempt < maxAttempts) {
+          continue;
+        }
+        throw lastError;
+      }
 
       if (execution.status !== 0) {
         lastError = new InvalidOperationError(execution.stderr || execution.stdout || 'Codex execution failed.', {

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { CriticReview, FileSnapshotMemory, MemorySummary, TaskPlan, ToolStep } from '../../domain';
 import { evaluationSchema, supervisorDecisionSchema } from '../../domain';
+import { CancelledError } from '../../errors';
 import type { LlmProvider } from '../../llm';
 import {
   buildCriticPrompt,
@@ -53,11 +54,13 @@ export class PlannerAgent {
     tools: ToolDefinition[];
     extraContext: string;
     exactFileSnapshots: FileSnapshotMemory[];
+    signal?: AbortSignal;
   }): Promise<TaskPlan> {
     const response = await this.provider.complete({
       prompt: buildPlanningPrompt(input.goal, input.memory, input.tools, input.extraContext, input.exactFileSnapshots),
       schema: taskPlanResponseSchema,
       contract: 'task_plan',
+      signal: input.signal,
     });
     return decodeTaskPlanResponse(response);
   }
@@ -66,7 +69,12 @@ export class PlannerAgent {
 export class CriticAgent {
   constructor(private readonly provider: LlmProvider) {}
 
-  async validate(plan: TaskPlan, availableTools: ToolDefinition[], context: StepValidationContext): Promise<CriticReview> {
+  async validate(
+    plan: TaskPlan,
+    availableTools: ToolDefinition[],
+    context: StepValidationContext,
+    signal?: AbortSignal,
+  ): Promise<CriticReview> {
     const unknownTool = plan.steps.find((step) => availableTools.every((tool) => tool.name !== step.tool));
     if (unknownTool) {
       return decodeCriticReviewResponse(
@@ -136,6 +144,7 @@ export class CriticAgent {
       prompt: buildCriticPrompt(plan, availableTools, context.exactFileSnapshots),
       schema: criticReviewResponseSchema,
       contract: 'critic_review',
+      signal,
     });
     return decodeCriticReviewResponse(response);
   }
@@ -220,12 +229,15 @@ export class VerifierAgent {
 export class SupervisorAgent {
   constructor(private readonly provider: LlmProvider) {}
 
-  async decide(input: {
-    hadFailure: boolean;
-    iteration: number;
-    maxIterations: number;
-    failures: string[];
-  }): Promise<z.infer<typeof supervisorDecisionSchema>> {
+  async decide(
+    input: {
+      hadFailure: boolean;
+      iteration: number;
+      maxIterations: number;
+      failures: string[];
+    },
+    signal?: AbortSignal,
+  ): Promise<z.infer<typeof supervisorDecisionSchema>> {
     if (!input.hadFailure) {
       return supervisorDecisionSchema.parse({
         decision: 'stop',
@@ -247,8 +259,12 @@ export class SupervisorAgent {
         }),
         schema: supervisorDecisionSchema,
         contract: 'supervisor_decision',
+        signal,
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof CancelledError) {
+        throw error;
+      }
       return createFallbackSupervisorDecision(input);
     }
   }
@@ -257,7 +273,10 @@ export class SupervisorAgent {
 export class EvaluatorAgent {
   constructor(private readonly provider: LlmProvider) {}
 
-  async evaluate(input: { totalSteps: number; verifiedSteps: number; failures: string[] }): Promise<z.infer<typeof evaluationSchema>> {
+  async evaluate(
+    input: { totalSteps: number; verifiedSteps: number; failures: string[] },
+    signal?: AbortSignal,
+  ): Promise<z.infer<typeof evaluationSchema>> {
     return this.provider.complete({
       prompt: buildEvaluatorPrompt({
         totalSteps: input.totalSteps,
@@ -266,6 +285,7 @@ export class EvaluatorAgent {
       }),
       schema: evaluationSchema,
       contract: 'evaluation',
+      signal,
     });
   }
 }

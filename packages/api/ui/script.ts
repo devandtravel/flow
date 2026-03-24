@@ -757,7 +757,7 @@ function describeEvent(event) {
     const deleteAfterStop = payload && payload.deleteAfterStop === true;
     const state = payload && typeof payload.state === 'string' ? payload.state : '';
     return {
-      title: deleteAfterStop ? 'Удаление запланировано' : 'Остановка запрошена',
+      title: deleteAfterStop ? 'Ожидание удаления после остановки' : 'Ожидание безопасной остановки',
       summary: deleteAfterStop
         ? 'Задача будет удалена после ближайшей безопасной точки остановки.'
         : 'Выполнение будет остановлено после ближайшей безопасной точки.',

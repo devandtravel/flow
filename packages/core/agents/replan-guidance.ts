@@ -5,6 +5,9 @@ export const replanFailureClassSchema = z.enum([
   'full_file_text_required',
   'invalid_patch_format',
   'snapshot_backed_write_required',
+  'directory_read_mismatch',
+  'speculative_path',
+  'nonexistent_path',
   'unknown_tool',
   'disabled_capability',
   'workspace_boundary',
@@ -38,6 +41,21 @@ const ruleDefinitions: ReplanRuleDefinition[] = [
     pattern: /file_snapshot memory|instead of repo\.apply_patch/i,
     failureClass: 'snapshot_backed_write_required',
     rule: 'Если exact file snapshot уже есть, не используй repo.apply_patch для этого файла; используй fs.write_file с полным итоговым текстом.',
+  },
+  {
+    pattern: /fs\.read_file.*directory|EISDIR: illegal operation on a directory, read|использует `fs\.read_file` для каталога/i,
+    failureClass: 'directory_read_mismatch',
+    rule: 'Не используй fs.read_file для каталогов; сначала применяй fs.list_dir и переходи к чтению только после подтверждения точного файла.',
+  },
+  {
+    pattern: /фиктивным пут[её]м|требуется уточнить реальный модуль|как получить конкретное значение|неподтвержд[её]нн|guess(ed)? path|placeholder path/i,
+    failureClass: 'speculative_path',
+    rule: 'Не строй дочерние пути и имена файлов по догадке; каждый новый сегмент пути должен быть подтверждён предыдущим observation-шагом или exact snapshot.',
+  },
+  {
+    pattern: /ENOENT: no such file or directory|scandir .* no such file or directory|такого файла или каталога не существует/i,
+    failureClass: 'nonexistent_path',
+    rule: 'Если путь не существует, перепланируйся от последнего подтверждённого каталога и не перебирай соседние пути вслепую.',
   },
   {
     pattern: /Unknown tool/i,

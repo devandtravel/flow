@@ -4,8 +4,10 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { buildDefaultConfig } from '../packages/config';
+import { buildReplanGuidance } from '../packages/core/agents/replan-guidance';
 import { CriticAgent, SupervisorAgent } from '../packages/core/agents';
 import type { FileSnapshotMemory } from '../packages/domain';
+import { CancelledError } from '../packages/errors';
 import { CodexProvider, MockLlmProvider, extractJsonObjectFromStdout, type LlmProvider, type LlmRequest } from '../packages/llm';
 import { buildPlanningPrompt, createJsonSchema, decodeTaskPlanResponse, taskPlanResponseSchema, toolStepResponseSchema } from '../packages/llm/contracts';
 import { createToolRegistry } from '../packages/tools';
@@ -94,6 +96,41 @@ describe('LLM providers', () => {
     expect(result.steps[0]?.tool).toBe('fs.list_dir');
   });
 
+  it('codex provider aborts an in-flight execution when the signal is cancelled', async () => {
+    const tempDirectory = mkdtempSync(path.join(os.tmpdir(), 'flow-llm-abort-'));
+    const executablePath = path.join(tempDirectory, 'mock-codex-slow.js');
+    writeFileSync(
+      executablePath,
+      [
+        '#!/usr/bin/env node',
+        "setTimeout(() => {",
+        "  console.log('{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"{\\\\\"goal\\\\\":\\\\\"demo\\\\\",\\\\\"assumptions\\\\\":[],\\\\\"risks\\\\\":[],\\\\\"steps\\\\\":[{\\\\\"tool\\\\\":\\\\\"fs.list_dir\\\\\",\\\\\"input_json\\\\\":\\\\\"{\\\\\\\\\\\\\"path\\\\\\\\\\\\\":\\\\\\\\\\\\\".\\\\\\\\\\\\\"}\\\\\",\\\\\"expected_json\\\\\":\\\\\"{\\\\\\\\\\\\\"success\\\\\\\\\\\\\":true}\\\\\",\\\\\"rationale\\\\\":\\\\\"observe\\\\\"}],\\\\\"done\\\\\":false,\\\\\"confidence\\\\\":0.5}\"}}');",
+        "}, 5000);",
+      ].join('\n'),
+      'utf8',
+    );
+    chmodSync(executablePath, 0o755);
+
+    const config = buildDefaultConfig('/tmp/flow-llm', 'project');
+    const provider = new CodexProvider({
+      ...config.llm,
+      executable: executablePath,
+    });
+    const controller = new AbortController();
+    const completion = provider.complete({
+      prompt: 'Return a task plan.',
+      schema: taskPlanResponseSchema,
+      contract: 'task_plan',
+      signal: controller.signal,
+    });
+
+    setTimeout(() => {
+      controller.abort();
+    }, 50);
+
+    await expect(completion).rejects.toBeInstanceOf(CancelledError);
+  });
+
   it('task plan schema is compatible with codex structured output requirements', () => {
     const schema = createJsonSchema('task_plan');
     expect(schema).toEqual({
@@ -149,6 +186,27 @@ describe('LLM providers', () => {
     expect(prompt).toContain('If ExtraContext contains doNotRepeatRules');
     expect(prompt).toContain('If Memory.semantic contains file_snapshot entries');
     expect(prompt).toContain('prefer fs.write_file with the complete final file text');
+    expect(prompt).toContain('do not plan reads or patches against guessed child paths');
+    expect(prompt).toContain('do not jump directly to guessed descendants');
+  });
+
+  it('builds discovery-focused replan guidance from path guessing failures', () => {
+    const guidance = buildReplanGuidance([
+      'Шаг 2 использует `fs.read_file` для каталога `apps/web/src/features`, что приведёт к ошибке.',
+      'Шаги 3 и 4 оперируют фиктивным путём `apps/web/src/features/<landing-module>/buy-button.tsx`.',
+      "ENOENT: no such file or directory, scandir '/tmp/missing'",
+    ]);
+
+    expect(guidance.failureClasses).toEqual(
+      expect.arrayContaining(['directory_read_mismatch', 'speculative_path', 'nonexistent_path']),
+    );
+    expect(guidance.doNotRepeatRules).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('Не используй fs.read_file для каталогов'),
+        expect.stringContaining('Не строй дочерние пути и имена файлов по догадке'),
+        expect.stringContaining('Если путь не существует, перепланируйся'),
+      ]),
+    );
   });
 
   it('critic rejects placeholder fs.write_file content before execution', async () => {

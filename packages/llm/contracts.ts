@@ -250,6 +250,9 @@ export function buildPlanningPrompt(
     '- if exact patch context is not yet known, add a read step first instead of guessing the patch',
     '- when a safe append or replacement can be expressed more reliably through fs.read_file plus fs.write_file, prefer that sequence over a speculative patch',
     '- for fs.read_file, expected_json should check a small observable property such as path or content_includes, not the entire file body',
+    '- when discovering code locations, do not plan reads or patches against guessed child paths; every path segment beyond an observed directory must come from an earlier observation step or ExactFileSnapshots',
+    '- if you only know a directory, the next discovery step may inspect only that exact confirmed directory; do not jump directly to guessed descendants such as landing, buy-button.tsx, index.tsx, or similar names',
+    '- if a path candidate has not been observed yet, add a new observation step to confirm it before any fs.read_file, fs.write_file, or repo.apply_patch step that depends on it',
   ].join('\n');
 }
 

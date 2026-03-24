@@ -8,6 +8,7 @@ import {
   taskPlanSchema,
   type ApprovalRequestRecord,
   type ArtifactRecord,
+  type Evaluation,
   type MaintenanceEventRecord,
   type MaintenanceTrigger,
   type RunEventRecord,
@@ -19,7 +20,7 @@ import {
   type TaskRecord,
 } from '../../domain';
 import { RuntimeDatabase, type TaskDeletionSummary as DatabaseTaskDeletionSummary } from '../../db/database';
-import { ConflictError, InvalidOperationError, NotFoundError, ValidationError } from '../../errors';
+import { CancelledError, ConflictError, InvalidOperationError, NotFoundError, ValidationError } from '../../errors';
 import { createLlmProvider } from '../../llm';
 import { MemoryService } from '../../memory';
 import { PolicyEngine } from '../../policy';
@@ -382,6 +383,8 @@ export class AgentRuntime {
   private readonly subscribers = new Set<(event: RuntimeUpdateEvent) => void>();
   private readonly stopRequestedTaskIds = new Set<string>();
   private readonly deleteAfterStopTaskIds = new Set<string>();
+  private readonly activeTaskIds = new Set<string>();
+  private readonly activeLlmAbortControllers = new Map<string, AbortController>();
 
   constructor(options: RuntimeOptions) {
     this.workspaceRoot = options.workspaceRoot;
@@ -663,6 +666,35 @@ export class AgentRuntime {
     this.deleteAfterStopTaskIds.delete(taskId);
   }
 
+  private isTaskActivelyRunning(taskId: string): boolean {
+    return this.activeTaskIds.has(taskId);
+  }
+
+  private abortActiveLlmOperation(taskId: string): void {
+    const controller = this.activeLlmAbortControllers.get(taskId);
+    if (!controller || controller.signal.aborted) {
+      return;
+    }
+
+    controller.abort();
+  }
+
+  private async runWithTaskAbortController<TResult>(
+    taskId: string,
+    operation: (signal: AbortSignal) => Promise<TResult>,
+  ): Promise<TResult> {
+    const controller = new AbortController();
+    this.activeLlmAbortControllers.set(taskId, controller);
+    try {
+      return await operation(controller.signal);
+    } finally {
+      const activeController = this.activeLlmAbortControllers.get(taskId);
+      if (activeController === controller) {
+        this.activeLlmAbortControllers.delete(taskId);
+      }
+    }
+  }
+
   private rejectPendingApprovalsForTask(taskId: string): void {
     for (const approval of this.database.listApprovalsByTask(taskId)) {
       if (approval.status !== 'pending') {
@@ -707,6 +739,17 @@ export class AgentRuntime {
         deleteAfterStop,
         state: task.state,
       });
+    }
+    this.abortActiveLlmOperation(taskId);
+
+    if (!this.isTaskActivelyRunning(taskId) && task.state !== 'queued' && task.state !== 'retryable' && task.state !== 'awaiting_approval') {
+      const cancelledTask = this.finalizeTaskCancellation(task, latestRun, 'Остановка выполнена для неактивной задачи.');
+      if (deleteAfterStop) {
+        this.deleteTaskImmediately(task.id);
+      } else {
+        this.clearTaskStopRequests(taskId);
+      }
+      return cancelledTask;
     }
 
     if (task.state === 'queued' || task.state === 'retryable' || task.state === 'awaiting_approval') {
@@ -1035,7 +1078,7 @@ export class AgentRuntime {
     };
   }
 
-  private async planTask(task: TaskRecord, target: TargetConfig): Promise<TaskPlan> {
+  private async planTask(task: TaskRecord, target: TargetConfig, signal?: AbortSignal): Promise<TaskPlan> {
     const toolCatalog = listToolDefinitions(this.tools).filter((tool) => target.capabilities.includes(tool.capability));
     const memory = this.memory.getContext();
     const exactFileSnapshots = this.memory.getTaskFileSnapshots(task.id);
@@ -1045,6 +1088,7 @@ export class AgentRuntime {
       goal: task.goal,
       memory,
       tools: toolCatalog,
+      signal,
       extraContext: JSON.stringify({
         target: {
           id: target.id,
@@ -1834,8 +1878,9 @@ export class AgentRuntime {
     let lastRunId = '';
     const createdArtifacts: ArtifactRecord[] = [];
     const createdApprovals: ApprovalRequestRecord[] = [];
-
-    while (iteration < this.config.limits.max_iterations) {
+    this.activeTaskIds.add(task.id);
+    try {
+      while (iteration < this.config.limits.max_iterations) {
       iteration += 1;
       if (task.state === 'queued' || task.state === 'retryable') {
         task = this.transitionTask(task, 'planning');
@@ -1869,7 +1914,7 @@ export class AgentRuntime {
       const planSource = await this.resolveApprovedStep(task);
       if (!planSource.approval) {
         try {
-          lastPlan = await this.planTask(task, target);
+          lastPlan = await this.runWithTaskAbortController(task.id, (signal) => this.planTask(task, target, signal));
           const stopAfterPlanning = this.applyStopRequestIfNeeded(task, this.database.getRun(run.id) ?? run, 'Остановка выполнена после построения плана.');
           if (stopAfterPlanning) {
             return {
@@ -1888,9 +1933,16 @@ export class AgentRuntime {
             confidence: lastPlan.confidence,
             preview: createPlanPreviewPayload(lastPlan),
           });
-          const review = await this.critic.validate(lastPlan, availableTools, {
-            exactFileSnapshots: this.memory.getTaskFileSnapshots(task.id),
-          });
+          const review = await this.runWithTaskAbortController(task.id, (signal) =>
+            this.critic.validate(
+              lastPlan,
+              availableTools,
+              {
+                exactFileSnapshots: this.memory.getTaskFileSnapshots(task.id),
+              },
+              signal,
+            ),
+          );
           lastPlan = review.plan;
           task = this.transitionTask(task, 'validating');
           this.transitionRun(this.database.getRun(run.id) ?? run, 'validating');
@@ -1913,12 +1965,14 @@ export class AgentRuntime {
             });
             this.finishRun(run, 'failed');
             task = this.transitionTask(task, 'failed');
-            const decision = await this.supervisor.decide({
-              hadFailure: true,
-              iteration,
-              maxIterations: this.config.limits.max_iterations,
-              failures: review.feedback,
-            });
+            const decision = await this.runWithTaskAbortController(task.id, (signal) =>
+              this.supervisor.decide({
+                hadFailure: true,
+                iteration,
+                maxIterations: this.config.limits.max_iterations,
+                failures: review.feedback,
+              }, signal),
+            );
             if (decision.decision === 'replan' || decision.decision === 'retry_same_step') {
               this.metrics.recordRetry();
               task = this.transitionTask(task, 'retryable');
@@ -1929,6 +1983,24 @@ export class AgentRuntime {
             break;
           }
         } catch (error) {
+          if (error instanceof CancelledError && this.isStopRequested(task.id)) {
+            const stopAfterPlanningCancellation = this.applyStopRequestIfNeeded(
+              task,
+              this.database.getRun(run.id) ?? run,
+              'Остановка выполнена во время planning.',
+            );
+            if (stopAfterPlanningCancellation) {
+              return {
+                task: stopAfterPlanningCancellation.task,
+                runId: run.id,
+                state: stopAfterPlanningCancellation.task.state,
+                plan: lastPlan,
+                artifacts: createdArtifacts,
+                approvals: createdApprovals,
+                metrics: this.metrics.snapshot(),
+              };
+            }
+          }
           const stopAfterPlanningFailure = this.applyStopRequestIfNeeded(task, this.database.getRun(run.id) ?? run, 'Остановка выполнена после завершения planning.');
           if (stopAfterPlanningFailure) {
             return {
@@ -1967,12 +2039,14 @@ export class AgentRuntime {
           });
           this.finishRun(run, 'failed');
           task = this.transitionTask(task, 'failed');
-          const decision = await this.supervisor.decide({
-            hadFailure: true,
-            iteration,
-            maxIterations: this.config.limits.max_iterations,
-            failures: [failureMessage],
-          });
+          const decision = await this.runWithTaskAbortController(task.id, (signal) =>
+            this.supervisor.decide({
+              hadFailure: true,
+              iteration,
+              maxIterations: this.config.limits.max_iterations,
+              failures: [failureMessage],
+            }, signal),
+          );
           if (decision.decision === 'replan' || decision.decision === 'retry_same_step') {
             this.metrics.recordRetry();
             task = this.transitionTask(task, 'retryable');
@@ -2199,11 +2273,36 @@ export class AgentRuntime {
           metrics: this.metrics.snapshot(),
         };
       }
-      const evaluation = await this.evaluator.evaluate({
-        totalSteps: lastPlan.steps.length,
-        verifiedSteps,
-        failures,
-      });
+      let evaluation: Evaluation;
+      try {
+        evaluation = await this.runWithTaskAbortController(task.id, (signal) =>
+          this.evaluator.evaluate({
+            totalSteps: lastPlan.steps.length,
+            verifiedSteps,
+            failures,
+          }, signal),
+        );
+      } catch (error) {
+        if (error instanceof CancelledError && this.isStopRequested(task.id)) {
+          const stopDuringEvaluation = this.applyStopRequestIfNeeded(
+            task,
+            this.database.getRun(run.id) ?? run,
+            'Остановка выполнена во время итоговой оценки.',
+          );
+          if (stopDuringEvaluation) {
+            return {
+              task: stopDuringEvaluation.task,
+              runId: run.id,
+              state: stopDuringEvaluation.task.state,
+              plan: lastPlan,
+              artifacts: createdArtifacts,
+              approvals: createdApprovals,
+              metrics: this.metrics.snapshot(),
+            };
+          }
+        }
+        throw error;
+      }
       this.database.createEvaluation(run.id, evaluation.score, evaluation.issues, evaluation.suggestions);
       this.memory.recordRun(run.id, {
         score: evaluation.score,
@@ -2228,12 +2327,14 @@ export class AgentRuntime {
         this.metrics.recordFailure(failures[0] ?? 'execution_failure');
         this.finishRun(run, 'failed');
         task = this.transitionTask(task, 'failed');
-        const decision = await this.supervisor.decide({
-          hadFailure: true,
-          iteration,
-          maxIterations: this.config.limits.max_iterations,
-          failures,
-        });
+        const decision = await this.runWithTaskAbortController(task.id, (signal) =>
+          this.supervisor.decide({
+            hadFailure: true,
+            iteration,
+            maxIterations: this.config.limits.max_iterations,
+            failures,
+          }, signal),
+        );
         this.createRunEvent(task.id, run.id, decision.decision === 'escalate' ? 'error' : 'warning', 'supervisor_decision', {
           decision: decision.decision,
           reason: decision.reason,
@@ -2265,19 +2366,23 @@ export class AgentRuntime {
       break;
     }
 
-    const refreshedTask = this.database.getTask(task.id);
-    if (!refreshedTask) {
-      throw new NotFoundError(`Task ${task.id} disappeared during execution.`, { taskId: task.id });
-    }
+      const refreshedTask = this.database.getTask(task.id);
+      if (!refreshedTask) {
+        throw new NotFoundError(`Task ${task.id} disappeared during execution.`, { taskId: task.id });
+      }
 
-    return {
-      task: refreshedTask,
-      runId: lastRunId,
-      state: refreshedTask.state,
-      plan: lastPlan,
-      artifacts: createdArtifacts,
-      approvals: createdApprovals,
-      metrics: this.metrics.snapshot(),
-    };
+      return {
+        task: refreshedTask,
+        runId: lastRunId,
+        state: refreshedTask.state,
+        plan: lastPlan,
+        artifacts: createdArtifacts,
+        approvals: createdApprovals,
+        metrics: this.metrics.snapshot(),
+      };
+    } finally {
+      this.activeTaskIds.delete(task.id);
+      this.activeLlmAbortControllers.delete(task.id);
+    }
   }
 }
